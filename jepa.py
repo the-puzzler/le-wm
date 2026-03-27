@@ -17,6 +17,8 @@ class JEPA(nn.Module):
         action_encoder,
         projector=None,
         pred_proj=None,
+        inverse_dynamics=None,
+        quantizer=None,
     ):
         super().__init__()
 
@@ -25,6 +27,8 @@ class JEPA(nn.Module):
         self.action_encoder = action_encoder
         self.projector = projector or nn.Identity()
         self.pred_proj = pred_proj or nn.Identity()
+        self.inverse_dynamics = inverse_dynamics or nn.Identity()
+        self.quantizer = quantizer
 
     def encode(self, info):
         """Encode observations and actions into embeddings.
@@ -43,6 +47,16 @@ class JEPA(nn.Module):
             info["act_emb"] = self.action_encoder(info["action"])
 
         return info
+
+    def infer_action_codes(self, emb):
+        """Infer continuous latent action codes from a latent state sequence."""
+        return self.inverse_dynamics(emb)
+
+    def quantize_action_codes(self, code_features):
+        """Quantize latent action codes with the configured codebook."""
+        if self.quantizer is None:
+            raise RuntimeError("quantizer is not configured on this model")
+        return self.quantizer(code_features)
 
     def predict(self, emb, act_emb):
         """Predict next state embedding

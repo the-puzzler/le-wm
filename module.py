@@ -379,3 +379,48 @@ class InverseDynamicsTransformer(nn.Module):
         x = self.dropout(x)
         x = self.transformer(x)
         return x
+
+
+class VectorQuantizer(nn.Module):
+    """VQ-VAE style codebook with straight-through estimation."""
+
+    def __init__(self, num_codes: int, code_dim: int, beta: float = 0.25):
+        super().__init__()
+        self.num_codes = num_codes
+        self.code_dim = code_dim
+        self.beta = beta
+        self.codebook = nn.Embedding(num_codes, code_dim)
+        self.codebook.weight.data.uniform_(-1.0 / num_codes, 1.0 / num_codes)
+
+    def forward(self, x):
+        """
+        x: (B, T, D)
+        returns:
+            quantized: (B, T, D)
+            indices: (B, T)
+            codebook_loss: scalar
+            commitment_loss: scalar
+        """
+        flat_x = x.reshape(-1, self.code_dim)
+        codebook = self.codebook.weight
+
+        distances = (
+            flat_x.pow(2).sum(dim=1, keepdim=True)
+            - 2 * flat_x @ codebook.t()
+            + codebook.pow(2).sum(dim=1)
+        )
+        indices = distances.argmin(dim=1)
+        quantized = self.codebook(indices).view_as(x)
+
+        codebook_loss = F.mse_loss(quantized, x.detach())
+        commitment_loss = F.mse_loss(x, quantized.detach())
+
+        # Straight-through estimator: forward uses quantized values, backward uses x.
+        quantized = x + (quantized - x).detach()
+
+        return {
+            "quantized": quantized,
+            "indices": indices.view(*x.shape[:-1]),
+            "codebook_loss": codebook_loss,
+            "commitment_loss": self.beta * commitment_loss,
+        }

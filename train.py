@@ -8,7 +8,7 @@ from omegaconf import OmegaConf, open_dict
 from tqdm.auto import tqdm
 
 from jepa import JEPA
-from module import ARPredictor, Embedder, MLP, SIGReg
+from module import ARPredictor, Embedder, InverseDynamicsTransformer, MLP, SIGReg, VectorQuantizer
 from utils import JsonlLogger, ModelArtifactSaver, get_column_normalizer, get_img_preprocessor
 
 
@@ -25,17 +25,26 @@ def lejepa_forward(model, sigreg, batch, cfg):
     output = model.encode(batch)
 
     emb = output["emb"]
-    act_emb = output["act_emb"]
 
     ctx_emb = emb[:, :ctx_len]
-    ctx_act = act_emb[:, :ctx_len]
+    code_features = model.infer_action_codes(emb[:, : ctx_len + n_preds])
+    vq_output = model.quantize_action_codes(code_features[:, :ctx_len])
+    ctx_act = vq_output["quantized"]
 
     tgt_emb = emb[:, n_preds:]
     pred_emb = model.predict(ctx_emb, ctx_act)
 
     output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
     output["sigreg_loss"] = sigreg(emb.transpose(0, 1))
-    output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]
+    output["codebook_loss"] = cfg.loss.vq.codebook_weight * vq_output["codebook_loss"]
+    output["commitment_loss"] = cfg.loss.vq.commitment_weight * vq_output["commitment_loss"]
+    output["loss"] = (
+        output["pred_loss"]
+        + lambd * output["sigreg_loss"]
+        + output["codebook_loss"]
+        + output["commitment_loss"]
+    )
+    output["code_indices"] = vq_output["indices"]
     return output
 
 
@@ -85,6 +94,8 @@ def evaluate(model, sigreg, loader, device, amp_dtype, cfg):
     total_loss = 0.0
     total_pred_loss = 0.0
     total_sigreg_loss = 0.0
+    total_codebook_loss = 0.0
+    total_commitment_loss = 0.0
     total_batches = 0
 
     progress = tqdm(loader, desc="val", leave=False)
@@ -97,6 +108,8 @@ def evaluate(model, sigreg, loader, device, amp_dtype, cfg):
             total_loss += output["loss"].detach().item()
             total_pred_loss += output["pred_loss"].detach().item()
             total_sigreg_loss += output["sigreg_loss"].detach().item()
+            total_codebook_loss += output["codebook_loss"].detach().item()
+            total_commitment_loss += output["commitment_loss"].detach().item()
             total_batches += 1
 
             if batch_idx % max(1, int(cfg.logging.get("log_interval", 1))) == 0:
@@ -104,15 +117,25 @@ def evaluate(model, sigreg, loader, device, amp_dtype, cfg):
                     loss=f"{total_loss / total_batches:.4f}",
                     pred=f"{total_pred_loss / total_batches:.4f}",
                     sigreg=f"{total_sigreg_loss / total_batches:.4f}",
+                    codebook=f"{total_codebook_loss / total_batches:.4f}",
+                    commit=f"{total_commitment_loss / total_batches:.4f}",
                 )
 
     if total_batches == 0:
-        return {"loss": 0.0, "pred_loss": 0.0, "sigreg_loss": 0.0}
+        return {
+            "loss": 0.0,
+            "pred_loss": 0.0,
+            "sigreg_loss": 0.0,
+            "codebook_loss": 0.0,
+            "commitment_loss": 0.0,
+        }
 
     return {
         "loss": total_loss / total_batches,
         "pred_loss": total_pred_loss / total_batches,
         "sigreg_loss": total_sigreg_loss / total_batches,
+        "codebook_loss": total_codebook_loss / total_batches,
+        "commitment_loss": total_commitment_loss / total_batches,
     }
 
 
@@ -123,6 +146,8 @@ def train_one_epoch(model, sigreg, loader, optimizer, scaler, device, amp_dtype,
     total_loss = 0.0
     total_pred_loss = 0.0
     total_sigreg_loss = 0.0
+    total_codebook_loss = 0.0
+    total_commitment_loss = 0.0
     total_batches = 0
 
     grad_clip = cfg.trainer.get("gradient_clip_val")
@@ -152,6 +177,8 @@ def train_one_epoch(model, sigreg, loader, optimizer, scaler, device, amp_dtype,
         total_loss += output["loss"].detach().item()
         total_pred_loss += output["pred_loss"].detach().item()
         total_sigreg_loss += output["sigreg_loss"].detach().item()
+        total_codebook_loss += output["codebook_loss"].detach().item()
+        total_commitment_loss += output["commitment_loss"].detach().item()
         total_batches += 1
 
         if batch_idx % max(1, int(cfg.logging.get("log_interval", 1))) == 0:
@@ -159,16 +186,26 @@ def train_one_epoch(model, sigreg, loader, optimizer, scaler, device, amp_dtype,
                 loss=f"{total_loss / total_batches:.4f}",
                 pred=f"{total_pred_loss / total_batches:.4f}",
                 sigreg=f"{total_sigreg_loss / total_batches:.4f}",
+                codebook=f"{total_codebook_loss / total_batches:.4f}",
+                commit=f"{total_commitment_loss / total_batches:.4f}",
                 lr=f"{optimizer.param_groups[0]['lr']:.2e}",
             )
 
     if total_batches == 0:
-        return {"loss": 0.0, "pred_loss": 0.0, "sigreg_loss": 0.0}
+        return {
+            "loss": 0.0,
+            "pred_loss": 0.0,
+            "sigreg_loss": 0.0,
+            "codebook_loss": 0.0,
+            "commitment_loss": 0.0,
+        }
 
     return {
         "loss": total_loss / total_batches,
         "pred_loss": total_pred_loss / total_batches,
         "sigreg_loss": total_sigreg_loss / total_batches,
+        "codebook_loss": total_codebook_loss / total_batches,
+        "commitment_loss": total_commitment_loss / total_batches,
     }
 
 
@@ -224,6 +261,13 @@ def run(cfg):
         output_dim=hidden_dim,
         **cfg.predictor,
     )
+    inverse_dynamics = InverseDynamicsTransformer(
+        num_frames=cfg.wm.history_size + cfg.wm.num_preds,
+        input_dim=embed_dim,
+        hidden_dim=hidden_dim,
+        output_dim=embed_dim,
+        **cfg.inverse_dynamics,
+    )
     action_encoder = Embedder(input_dim=effective_act_dim, emb_dim=embed_dim)
     projector = MLP(
         input_dim=hidden_dim,
@@ -237,6 +281,11 @@ def run(cfg):
         hidden_dim=2048,
         norm_fn=torch.nn.BatchNorm1d,
     )
+    quantizer = VectorQuantizer(
+        num_codes=cfg.codebook.num_codes,
+        code_dim=embed_dim,
+        beta=cfg.codebook.beta,
+    )
 
     model = JEPA(
         encoder=encoder,
@@ -244,6 +293,8 @@ def run(cfg):
         action_encoder=action_encoder,
         projector=projector,
         pred_proj=predictor_proj,
+        inverse_dynamics=inverse_dynamics,
+        quantizer=quantizer,
     )
     sigreg = SIGReg(**cfg.loss.sigreg.kwargs)
 
@@ -304,9 +355,13 @@ def run(cfg):
             "train/loss": train_metrics["loss"],
             "train/pred_loss": train_metrics["pred_loss"],
             "train/sigreg_loss": train_metrics["sigreg_loss"],
+            "train/codebook_loss": train_metrics["codebook_loss"],
+            "train/commitment_loss": train_metrics["commitment_loss"],
             "val/loss": val_metrics["loss"],
             "val/pred_loss": val_metrics["pred_loss"],
             "val/sigreg_loss": val_metrics["sigreg_loss"],
+            "val/codebook_loss": val_metrics["codebook_loss"],
+            "val/commitment_loss": val_metrics["commitment_loss"],
         }
         metrics_logger.log(metrics)
         artifact_saver.save_epoch(model=model, epoch=epoch, max_epochs=max_epochs)
