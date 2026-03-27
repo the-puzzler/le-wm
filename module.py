@@ -84,6 +84,43 @@ class Attention(nn.Module):
         out = rearrange(out, "b h t d -> b t (h d)")
         return self.to_out(out)
 
+class IDAttention(nn.Module):
+    """Scaled dot-product attention with causal masking"""
+
+    def __init__(self, dim, heads=8, dim_head=64, dropout=0.0):
+        super().__init__()
+        inner_dim = dim_head * heads
+        project_out = not (heads == 1 and dim_head == dim)
+        self.heads = heads
+        self.scale = dim_head**-0.5
+        self.dropout = dropout
+        self.norm = nn.LayerNorm(dim)
+        self.attend = nn.Softmax(dim=-1)
+        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
+        self.to_out = (
+            nn.Sequential(nn.Linear(inner_dim, dim), nn.Dropout(dropout))
+            if project_out
+            else nn.Identity()
+        )
+        
+
+    def forward(self, x):
+        """
+        x : (B, T, D)
+        """
+        _, T, _ = x.shape
+        x = self.norm(x)
+        #Can see everything before t and t+1
+        peekattnmask = torch.triu(
+            torch.ones((T, T), device=x.device, dtype=torch.bool),
+            diagonal=-1,
+        )
+        drop = self.dropout if self.training else 0.0
+        qkv = self.to_qkv(x).chunk(3, dim=-1)  # q, k, v: (B, heads, T, dim_head)
+        q, k, v = (rearrange(t, "b t (h d) -> b h t d", h=self.heads) for t in qkv)
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=drop, is_causal=False, attn_mask=peekattnmask)
+        out = rearrange(out, "b h t d -> b t (h d)")
+        return self.to_out(out)
 
 class ConditionalBlock(nn.Module):
     """Transformer block with AdaLN-zero conditioning"""
@@ -126,6 +163,22 @@ class Block(nn.Module):
         x = x + self.attn(self.norm1(x))
         x = x + self.mlp(self.norm2(x))
         return x
+    
+class IDBlock(nn.Module):
+    """Standard Transformer block"""
+
+    def __init__(self, dim, heads, dim_head, mlp_dim, dropout=0.0):
+        super().__init__()
+
+        self.attn = IDAttention(dim, heads=heads, dim_head=dim_head, dropout=dropout)
+        self.mlp = FeedForward(dim, mlp_dim, dropout=dropout)
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
 
 
 class Transformer(nn.Module):
@@ -144,6 +197,7 @@ class Transformer(nn.Module):
         block_class=Block,
     ):
         super().__init__()
+        self.is_conditional = block_class is ConditionalBlock
         self.norm = nn.LayerNorm(hidden_dim)
         self.layers = nn.ModuleList([])
 
@@ -153,11 +207,12 @@ class Transformer(nn.Module):
             else nn.Identity()
         )
 
-        self.cond_proj = (
-            nn.Linear(input_dim, hidden_dim)
-            if input_dim != hidden_dim
-            else nn.Identity()
-        )
+        if self.is_conditional:
+            self.cond_proj = (
+                nn.Linear(input_dim, hidden_dim)
+                if input_dim != hidden_dim
+                else nn.Identity()
+            )
 
         self.output_proj = (
             nn.Linear(hidden_dim, output_dim)
@@ -175,11 +230,11 @@ class Transformer(nn.Module):
         if hasattr(self, "input_proj"):
             x = self.input_proj(x)
 
-        if c is not None and hasattr(self, "cond_proj"):
+        if self.is_conditional and c is not None and hasattr(self, "cond_proj"):
             c = self.cond_proj(c)
 
         for block in self.layers:
-            x = block(x) if isinstance(block, Block) else block(x, c)
+            x = block(x, c) if self.is_conditional else block(x)
         x = self.norm(x)
 
         if hasattr(self, "output_proj"):
@@ -282,4 +337,45 @@ class ARPredictor(nn.Module):
         x = x + self.pos_embedding[:, :T]
         x = self.dropout(x)
         x = self.transformer(x, c)
+        return x
+
+
+class InverseDynamicsTransformer(nn.Module):
+    def __init__(
+        self,
+        *,
+        num_frames,
+        depth,
+        heads,
+        mlp_dim,
+        input_dim,
+        hidden_dim,
+        output_dim=None,
+        dim_head=64,
+        dropout=0.0,
+        emb_dropout=0.0,
+    ):
+        super().__init__()
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_frames, input_dim))
+        self.dropout = nn.Dropout(emb_dropout)
+        self.transformer = Transformer(
+            input_dim,
+            hidden_dim,
+            output_dim or input_dim,
+            depth,
+            heads,
+            dim_head,
+            mlp_dim,
+            dropout,
+            block_class=IDBlock,
+        )
+
+    def forward(self, x):
+        """
+        x: (B, T, d)
+        """
+        T = x.size(1)
+        x = x + self.pos_embedding[:, :T]
+        x = self.dropout(x)
+        x = self.transformer(x)
         return x
