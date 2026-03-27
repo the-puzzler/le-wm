@@ -23,6 +23,8 @@ trainer:
 
 logging:
   log_interval: 1
+  plot_interval: 5
+  save_tsv: True
 
 loader:
   batch_size: 128
@@ -41,6 +43,7 @@ wm:
   history_size: 3
   num_preds: 1
   embed_dim: 192
+  use_learned_actions: True
 
 codebook:
   num_codes: 8

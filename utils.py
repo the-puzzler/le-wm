@@ -1,8 +1,13 @@
 import numpy as np
 import torch
 import json
+import csv
 from pathlib import Path
 from stable_pretraining import data as dt
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 def get_img_preprocessor(source: str, target: str, img_size: int = 224):
     imagenet_stats = dt.dataset_stats.ImageNet
@@ -77,3 +82,70 @@ class JsonlLogger:
 
         with self.path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(serializable) + "\n")
+
+
+class TsvLogger:
+    """Append tab-separated metrics to disk with a single header row."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fieldnames = None
+
+    def log(self, payload: dict):
+        serializable = {}
+        for key, value in payload.items():
+            if isinstance(value, torch.Tensor):
+                serializable[key] = float(value.detach().cpu().item())
+            elif isinstance(value, np.generic):
+                serializable[key] = value.item()
+            else:
+                serializable[key] = value
+
+        if self._fieldnames is None:
+            self._fieldnames = list(serializable.keys())
+            if self.path.exists() and self.path.stat().st_size > 0:
+                with self.path.open("r", encoding="utf-8", newline="") as f:
+                    reader = csv.reader(f, delimiter="\t")
+                    self._fieldnames = next(reader)
+
+        with self.path.open("a", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self._fieldnames, delimiter="\t")
+            if f.tell() == 0:
+                writer.writeheader()
+            writer.writerow({k: serializable.get(k, "") for k in self._fieldnames})
+
+
+def save_training_plots(history: list[dict], output_path):
+    """Save a compact training dashboard with loss subplots."""
+    if not history:
+        return
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    epochs = [row["epoch"] for row in history]
+    fig, axes = plt.subplots(2, 3, figsize=(14, 8), sharex=True)
+    axes = axes.ravel()
+
+    plots = [
+        ("Total Loss", "train/loss", "val/loss"),
+        ("Prediction Loss", "train/pred_loss", "val/pred_loss"),
+        ("SIGReg Loss", "train/sigreg_loss", "val/sigreg_loss"),
+        ("Codebook Loss", "train/codebook_loss", "val/codebook_loss"),
+        ("Commitment Loss", "train/commitment_loss", "val/commitment_loss"),
+        ("Learning Rate", "lr", None),
+    ]
+
+    for ax, (title, train_key, val_key) in zip(axes, plots):
+        ax.plot(epochs, [row[train_key] for row in history], label=train_key, linewidth=2)
+        if val_key is not None:
+            ax.plot(epochs, [row[val_key] for row in history], label=val_key, linewidth=2)
+        ax.set_title(title)
+        ax.set_xlabel("Epoch")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)

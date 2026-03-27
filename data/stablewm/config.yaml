@@ -34,10 +34,20 @@ wm:
   action_dim: 2
   proprio_dim: 4
   state_dim: 7
+codebook:
+  num_codes: 8
+  beta: 0.25
 predictor:
   depth: 6
   heads: 16
   mlp_dim: 2048
+  dim_head: 64
+  dropout: 0.1
+  emb_dropout: 0.0
+inverse_dynamics:
+  depth: 4
+  heads: 8
+  mlp_dim: 1024
   dim_head: 64
   dropout: 0.1
   emb_dropout: 0.0
@@ -47,6 +57,9 @@ loss:
     kwargs:
       knots: 17
       num_proj: 1024
+  vq:
+    codebook_weight: 1.0
+    commitment_weight: 1.0
 data:
   dataset:
     num_steps: ${eval:'${wm.num_preds} + ${wm.history_size}'}

@@ -9,7 +9,14 @@ from tqdm.auto import tqdm
 
 from jepa import JEPA
 from module import ARPredictor, Embedder, InverseDynamicsTransformer, MLP, SIGReg, VectorQuantizer
-from utils import JsonlLogger, ModelArtifactSaver, get_column_normalizer, get_img_preprocessor
+from utils import (
+    JsonlLogger,
+    ModelArtifactSaver,
+    TsvLogger,
+    get_column_normalizer,
+    get_img_preprocessor,
+    save_training_plots,
+)
 
 
 def lejepa_forward(model, sigreg, batch, cfg):
@@ -27,24 +34,30 @@ def lejepa_forward(model, sigreg, batch, cfg):
     emb = output["emb"]
 
     ctx_emb = emb[:, :ctx_len]
-    code_features = model.infer_action_codes(emb[:, : ctx_len + n_preds])
-    vq_output = model.quantize_action_codes(code_features[:, :ctx_len])
-    ctx_act = vq_output["quantized"]
+    if cfg.wm.use_learned_actions:
+        code_features = model.infer_action_codes(emb[:, : ctx_len + n_preds])
+        vq_output = model.quantize_action_codes(code_features[:, :ctx_len])
+        ctx_act = vq_output["quantized"]
+        output["code_indices"] = vq_output["indices"]
+        output["codebook_loss"] = cfg.loss.vq.codebook_weight * vq_output["codebook_loss"]
+        output["commitment_loss"] = cfg.loss.vq.commitment_weight * vq_output["commitment_loss"]
+    else:
+        act_emb = output["act_emb"]
+        ctx_act = act_emb[:, :ctx_len]
+        output["codebook_loss"] = emb.new_zeros(())
+        output["commitment_loss"] = emb.new_zeros(())
 
     tgt_emb = emb[:, n_preds:]
     pred_emb = model.predict(ctx_emb, ctx_act)
 
     output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
     output["sigreg_loss"] = sigreg(emb.transpose(0, 1))
-    output["codebook_loss"] = cfg.loss.vq.codebook_weight * vq_output["codebook_loss"]
-    output["commitment_loss"] = cfg.loss.vq.commitment_weight * vq_output["commitment_loss"]
     output["loss"] = (
         output["pred_loss"]
         + lambd * output["sigreg_loss"]
         + output["codebook_loss"]
         + output["commitment_loss"]
     )
-    output["code_indices"] = vq_output["indices"]
     return output
 
 
@@ -324,9 +337,12 @@ def run(cfg):
         dirpath=run_dir, filename=cfg.output_model_name, epoch_interval=1
     )
     metrics_logger = JsonlLogger(run_dir / "metrics.jsonl")
+    tsv_logger = TsvLogger(run_dir / "metrics.tsv") if cfg.logging.get("save_tsv", True) else None
+    history = []
 
     max_epochs = int(cfg.trainer.max_epochs)
     log_interval = max(1, int(cfg.logging.get("log_interval", 1)))
+    plot_interval = max(1, int(cfg.logging.get("plot_interval", 5)))
     for epoch in range(1, max_epochs + 1):
         train_metrics = train_one_epoch(
             model=model,
@@ -363,8 +379,13 @@ def run(cfg):
             "val/codebook_loss": val_metrics["codebook_loss"],
             "val/commitment_loss": val_metrics["commitment_loss"],
         }
+        history.append(metrics)
         metrics_logger.log(metrics)
+        if tsv_logger is not None:
+            tsv_logger.log(metrics)
         artifact_saver.save_epoch(model=model, epoch=epoch, max_epochs=max_epochs)
+        if epoch % plot_interval == 0 or epoch == 1 or epoch == max_epochs:
+            save_training_plots(history, run_dir / "training_curves.png")
 
         if epoch % log_interval == 0 or epoch == 1 or epoch == max_epochs:
             print(
