@@ -21,3 +21,20 @@ Initial plan:
 2. locate where actions enter the model
 3. replace the action pathway with inferred discrete codes
 4. compare against the original action-conditioned baseline
+
+Dataset setup for PushT:
+```bash
+export STABLEWM_HOME="$HOME/.stable-wm"
+mkdir -p "$STABLEWM_HOME"
+cd "$STABLEWM_HOME"
+
+curl -L -o pusht_expert_train.h5.zst \
+  https://huggingface.co/datasets/quentinll/lewm-pusht/resolve/main/pusht_expert_train.h5.zst
+
+unzstd pusht_expert_train.h5.zst
+```
+
+This should produce:
+```bash
+$STABLEWM_HOME/pusht_expert_train.h5
+```
