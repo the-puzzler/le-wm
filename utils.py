@@ -1,8 +1,8 @@
 import numpy as np
 import torch
+import json
 from pathlib import Path
 from stable_pretraining import data as dt
-from lightning.pytorch.callbacks import Callback
 
 def get_img_preprocessor(source: str, target: str, img_size: int = 224):
     imagenet_stats = dt.dataset_stats.ImageNet
@@ -25,33 +25,55 @@ def get_column_normalizer(dataset, source: str, target: str):
     normalizer = dt.transforms.WrapTorchTransform(norm_fn, source=source, target=target)
     return normalizer
 
-class ModelObjectCallBack(Callback):
-    """Callback to pickle model object after each epoch."""
+class ModelArtifactSaver:
+    """Persist model objects and state dicts during plain PyTorch training."""
 
     def __init__(self, dirpath, filename="model_object", epoch_interval: int = 1):
-        super().__init__()
         self.dirpath = Path(dirpath)
         self.filename = filename
         self.epoch_interval = epoch_interval
+        self.dirpath.mkdir(parents=True, exist_ok=True)
 
-    def on_train_epoch_end(self, trainer, pl_module):
-        super().on_train_epoch_end(trainer, pl_module)
+    def save_epoch(self, model, epoch: int, max_epochs: int):
+        if (epoch % self.epoch_interval) != 0 and epoch != max_epochs:
+            return
 
-        output_path = (
-            self.dirpath
-            / f"{self.filename}_epoch_{trainer.current_epoch + 1}_object.ckpt"
-        )
+        self._dump_model(model, self.dirpath / f"{self.filename}_epoch_{epoch}_object.ckpt")
+        self._dump_state(model, self.dirpath / f"{self.filename}_epoch_{epoch}_weights.ckpt")
 
-        if trainer.is_global_zero:
-            if (trainer.current_epoch + 1) % self.epoch_interval == 0:
-                self._dump_model(pl_module.model, output_path)
-
-            # save final epoch
-            if (trainer.current_epoch + 1) == trainer.max_epochs:
-                self._dump_model(pl_module.model, output_path)
+    def save_final(self, model):
+        self._dump_model(model, self.dirpath / f"{self.filename}_object.ckpt")
+        self._dump_state(model, self.dirpath / f"{self.filename}_weights.ckpt")
 
     def _dump_model(self, model, path):
         try:
             torch.save(model, path)
         except Exception as e:
             print(f"Error saving model object: {e}")
+
+    def _dump_state(self, model, path):
+        try:
+            torch.save(model.state_dict(), path)
+        except Exception as e:
+            print(f"Error saving model weights: {e}")
+
+
+class JsonlLogger:
+    """Append newline-delimited JSON metrics to disk."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def log(self, payload: dict):
+        serializable = {}
+        for key, value in payload.items():
+            if isinstance(value, torch.Tensor):
+                serializable[key] = float(value.detach().cpu().item())
+            elif isinstance(value, np.generic):
+                serializable[key] = value.item()
+            else:
+                serializable[key] = value
+
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(serializable) + "\n")

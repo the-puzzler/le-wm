@@ -1,0 +1,19 @@
+[project]
+name = "le-wm"
+version = "0.1.0"
+description = "LeWorldModel training and evaluation code"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "einops>=0.8.0",
+    "hydra-core>=1.3.2",
+    "numpy>=1.26.0",
+    "omegaconf>=2.3.0",
+    "scikit-learn>=1.5.0",
+    "stable-pretraining",
+    "stable-worldmodel[env,train]",
+    "torch>=2.3.0",
+    "torchvision>=0.18.0",
+    "tqdm>=4.66.0",
+    "zstandard>=0.23.0",
+]

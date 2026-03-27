@@ -3,9 +3,3 @@
 
 defaults:
   - override /hydra/launcher: basic
-
-wandb:
-  enabled: True
-  config:
-    project: le-wm
-    entity: le-wm

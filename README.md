@@ -27,7 +27,7 @@ If you find this code useful, please reference it in your paper:
 ```
 
 ## Using the code
-This codebase builds on [stable-worldmodel](https://github.com/galilai-group/stable-worldmodel) for environment management, planning, and evaluation, and [stable-pretraining](https://github.com/galilai-group/stable-pretraining) for training. Together they reduce this repository to its core contribution: the model architecture and training objective.
+This codebase builds on [stable-worldmodel](https://github.com/galilai-group/stable-worldmodel) for environment management, planning, and evaluation, and [stable-pretraining](https://github.com/galilai-group/stable-pretraining) for datasets, transforms, and encoder backbones. Training in this repository uses a plain PyTorch loop.
 
 **Installation:**
 ```bash
@@ -55,20 +55,12 @@ Dataset names are specified without the `.h5` extension. For example, `config/tr
 
 `jepa.py` contains the PyTorch implementation of LeWM. Training is configured via [Hydra](https://hydra.cc/) config files under `config/train/`.
 
-Before training, set your WandB `entity` and `project` in `config/train/lewm.yaml`:
-```yaml
-wandb:
-  config:
-    entity: your_entity
-    project: your_project
-```
-
 To launch training:
 ```bash
 python train.py data=pusht
 ```
 
-Checkpoints are saved to `$STABLEWM_HOME` upon completion.
+Training writes checkpoints and a local `metrics.jsonl` log to `$STABLEWM_HOME/<run_id>/`.
 
 For baseline scripts, see the stable-worldmodel [scripts](https://github.com/galilai-group/stable-worldmodel/tree/main/scripts/train) folder.
 
@@ -106,7 +98,7 @@ Pre-trained checkpoints are available on [Google Drive](https://drive.google.com
 
 Each tar archive contains two files per checkpoint:
 - `<name>_object.ckpt` — a serialized Python object for convenient loading; this is what `eval.py` and the `stable_worldmodel` API use
-- `<name>_weight.ckpt` — a weights-only checkpoint (`state_dict`) for cases where you want to load weights into your own model instance
+- `<name>_weights.ckpt` — a weights-only checkpoint (`state_dict`) for cases where you want to load weights into your own model instance
 
 To load the object checkpoint via the `stable_worldmodel` API:
 

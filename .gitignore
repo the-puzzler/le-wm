@@ -1,0 +1,5 @@
+.venv
+outputs
+*cpython*
+*.h5
+*.zst

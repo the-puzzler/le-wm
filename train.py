@@ -1,59 +1,186 @@
-import os
-from functools import partial
 from pathlib import Path
 
 import hydra
-import lightning as pl
 import stable_pretraining as spt
 import stable_worldmodel as swm
 import torch
-from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
+from tqdm.auto import tqdm
 
 from jepa import JEPA
 from module import ARPredictor, Embedder, MLP, SIGReg
-from utils import get_column_normalizer, get_img_preprocessor, ModelObjectCallBack
+from utils import JsonlLogger, ModelArtifactSaver, get_column_normalizer, get_img_preprocessor
 
 
-def lejepa_forward(self, batch, stage, cfg):
-    """encode observations, predict next states, compute losses."""
+def lejepa_forward(model, sigreg, batch, cfg):
+    """Encode observations, predict next states, and compute losses."""
 
     ctx_len = cfg.wm.history_size
     n_preds = cfg.wm.num_preds
     lambd = cfg.loss.sigreg.weight
 
-    # Replace NaN values with 0 (occurs at sequence boundaries)
+    batch = dict(batch)
     batch["action"] = torch.nan_to_num(batch["action"], 0.0)
 
-    output = self.model.encode(batch)
+    output = model.encode(batch)
 
-    emb = output["emb"]  # (B, T, D)
+    emb = output["emb"]
     act_emb = output["act_emb"]
 
     ctx_emb = emb[:, :ctx_len]
-    ctx_act = act_emb[:, : ctx_len]
+    ctx_act = act_emb[:, :ctx_len]
 
-    tgt_emb = emb[:, n_preds:] # label
-    pred_emb = self.model.predict(ctx_emb, ctx_act) # pred
+    tgt_emb = emb[:, n_preds:]
+    pred_emb = model.predict(ctx_emb, ctx_act)
 
-    # LeWM loss
     output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
-    output["sigreg_loss"]= self.sigreg(emb.transpose(0, 1))
-    output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]  
-
-    losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
-    self.log_dict(losses_dict, on_step=True, sync_dist=True)
+    output["sigreg_loss"] = sigreg(emb.transpose(0, 1))
+    output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]
     return output
+
+
+def resolve_device(cfg):
+    accelerator = str(cfg.trainer.get("accelerator", "auto")).lower()
+    if accelerator == "cpu":
+        return torch.device("cpu")
+    if torch.cuda.is_available():
+        devices = cfg.trainer.get("devices", "auto")
+        if isinstance(devices, int):
+            return torch.device("cuda:0")
+        if isinstance(devices, str) and devices not in {"auto", ""}:
+            return torch.device(f"cuda:{int(devices.split(',')[0])}")
+        if isinstance(devices, (list, tuple)) and devices:
+            return torch.device(f"cuda:{int(devices[0])}")
+        return torch.device("cuda:0")
+    return torch.device("cpu")
+
+
+def resolve_amp(device, precision):
+    precision = str(precision).lower()
+    if device.type != "cuda":
+        return None, False
+    if precision == "bf16":
+        return torch.bfloat16, False
+    if precision in {"16", "fp16", "float16"}:
+        return torch.float16, True
+    return None, False
+
+
+def move_batch_to_device(batch, device):
+    moved = {}
+    for key, value in batch.items():
+        moved[key] = value.to(device, non_blocking=True) if torch.is_tensor(value) else value
+    return moved
+
+
+def maybe_step_scheduler(scheduler):
+    if scheduler is not None:
+        scheduler.step()
+
+
+def evaluate(model, sigreg, loader, device, amp_dtype, cfg):
+    model.eval()
+    sigreg.eval()
+
+    total_loss = 0.0
+    total_pred_loss = 0.0
+    total_sigreg_loss = 0.0
+    total_batches = 0
+
+    progress = tqdm(loader, desc="val", leave=False)
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(progress, start=1):
+            batch = move_batch_to_device(batch, device)
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
+                output = lejepa_forward(model, sigreg, batch, cfg)
+
+            total_loss += output["loss"].detach().item()
+            total_pred_loss += output["pred_loss"].detach().item()
+            total_sigreg_loss += output["sigreg_loss"].detach().item()
+            total_batches += 1
+
+            if batch_idx % max(1, int(cfg.logging.get("log_interval", 1))) == 0:
+                progress.set_postfix(
+                    loss=f"{total_loss / total_batches:.4f}",
+                    pred=f"{total_pred_loss / total_batches:.4f}",
+                    sigreg=f"{total_sigreg_loss / total_batches:.4f}",
+                )
+
+    if total_batches == 0:
+        return {"loss": 0.0, "pred_loss": 0.0, "sigreg_loss": 0.0}
+
+    return {
+        "loss": total_loss / total_batches,
+        "pred_loss": total_pred_loss / total_batches,
+        "sigreg_loss": total_sigreg_loss / total_batches,
+    }
+
+
+def train_one_epoch(model, sigreg, loader, optimizer, scaler, device, amp_dtype, cfg):
+    model.train()
+    sigreg.train()
+
+    total_loss = 0.0
+    total_pred_loss = 0.0
+    total_sigreg_loss = 0.0
+    total_batches = 0
+
+    grad_clip = cfg.trainer.get("gradient_clip_val")
+
+    progress = tqdm(loader, desc="train", leave=False)
+    for batch_idx, batch in enumerate(progress, start=1):
+        batch = move_batch_to_device(batch, device)
+        optimizer.zero_grad(set_to_none=True)
+
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
+            output = lejepa_forward(model, sigreg, batch, cfg)
+            loss = output["loss"]
+
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            if grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            if grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+
+        total_loss += output["loss"].detach().item()
+        total_pred_loss += output["pred_loss"].detach().item()
+        total_sigreg_loss += output["sigreg_loss"].detach().item()
+        total_batches += 1
+
+        if batch_idx % max(1, int(cfg.logging.get("log_interval", 1))) == 0:
+            progress.set_postfix(
+                loss=f"{total_loss / total_batches:.4f}",
+                pred=f"{total_pred_loss / total_batches:.4f}",
+                sigreg=f"{total_sigreg_loss / total_batches:.4f}",
+                lr=f"{optimizer.param_groups[0]['lr']:.2e}",
+            )
+
+    if total_batches == 0:
+        return {"loss": 0.0, "pred_loss": 0.0, "sigreg_loss": 0.0}
+
+    return {
+        "loss": total_loss / total_batches,
+        "pred_loss": total_pred_loss / total_batches,
+        "sigreg_loss": total_sigreg_loss / total_batches,
+    }
+
+
+def build_scheduler(optimizer, max_epochs: int):
+    return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs)
+
 
 @hydra.main(version_base=None, config_path="./config/train", config_name="lewm")
 def run(cfg):
-    #########################
-    ##       dataset       ##
-    #########################
+    dataset = swm.data.HDF5Dataset(**cfg.data.dataset, cache_dir=cfg.cache_dir, transform=None)
+    transforms = [get_img_preprocessor(source="pixels", target="pixels", img_size=cfg.img_size)]
 
-    dataset = swm.data.HDF5Dataset(**cfg.data.dataset, transform=None)
-    transforms = [get_img_preprocessor(source='pixels', target='pixels', img_size=cfg.img_size)]
-    
     with open_dict(cfg):
         for col in cfg.data.dataset.keys_to_load:
             if col.startswith("pixels"):
@@ -61,7 +188,6 @@ def run(cfg):
 
             normalizer = get_column_normalizer(dataset, col, col)
             transforms.append(normalizer)
-
             setattr(cfg.wm, f"{col}_dim", dataset.get_dim(col))
 
     transform = spt.data.transforms.Compose(*transforms)
@@ -72,12 +198,12 @@ def run(cfg):
         dataset, lengths=[cfg.train_split, 1 - cfg.train_split], generator=rnd_gen
     )
 
-    train = torch.utils.data.DataLoader(train_set, **cfg.loader,shuffle=True, drop_last=True, generator=rnd_gen)
-    val = torch.utils.data.DataLoader(val_set, **cfg.loader, shuffle=False, drop_last=False)
-    
-    ##############################
-    ##       model / optim      ##
-    ##############################
+    train_loader = torch.utils.data.DataLoader(
+        train_set, **cfg.loader, shuffle=True, drop_last=True, generator=rnd_gen
+    )
+    val_loader = torch.utils.data.DataLoader(
+        val_set, **cfg.loader, shuffle=False, drop_last=False
+    )
 
     encoder = spt.backbone.utils.vit_hf(
         cfg.encoder_scale,
@@ -98,16 +224,13 @@ def run(cfg):
         output_dim=hidden_dim,
         **cfg.predictor,
     )
-
     action_encoder = Embedder(input_dim=effective_act_dim, emb_dim=embed_dim)
-    
     projector = MLP(
         input_dim=hidden_dim,
         output_dim=embed_dim,
         hidden_dim=2048,
         norm_fn=torch.nn.BatchNorm1d,
     )
-
     predictor_proj = MLP(
         input_dim=hidden_dim,
         output_dim=embed_dim,
@@ -115,68 +238,88 @@ def run(cfg):
         norm_fn=torch.nn.BatchNorm1d,
     )
 
-    world_model = JEPA(
+    model = JEPA(
         encoder=encoder,
         predictor=predictor,
         action_encoder=action_encoder,
         projector=projector,
         pred_proj=predictor_proj,
     )
+    sigreg = SIGReg(**cfg.loss.sigreg.kwargs)
 
-    optimizers = {
-        'model_opt': {
-            "modules": 'model',
-            "optimizer": dict(cfg.optimizer),
-            "scheduler": {"type": "LinearWarmupCosineAnnealingLR"},
-            "interval": "epoch",
-        },
+    device = resolve_device(cfg)
+    amp_dtype, use_grad_scaler = resolve_amp(device, cfg.trainer.get("precision", "32"))
+    model = model.to(device)
+    sigreg = sigreg.to(device)
+
+    optimizer_cls = getattr(torch.optim, cfg.optimizer.type)
+    optimizer_kwargs = {
+        key: OmegaConf.to_container(value, resolve=True) if OmegaConf.is_config(value) else value
+        for key, value in cfg.optimizer.items()
+        if key != "type"
     }
-
-    data_module = spt.data.DataModule(train=train, val=val)
-    world_model = spt.Module(
-        model = world_model,
-        sigreg = SIGReg(**cfg.loss.sigreg.kwargs),
-        forward=partial(lejepa_forward, cfg=cfg),
-        optim=optimizers,
-    )
-
-    ##########################
-    ##       training       ##
-    ##########################
+    optimizer = optimizer_cls(model.parameters(), **optimizer_kwargs)
+    scheduler = build_scheduler(optimizer, max_epochs=cfg.trainer.max_epochs)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_grad_scaler)
 
     run_id = cfg.get("subdir") or ""
-    run_dir = Path(swm.data.utils.get_cache_dir(), run_id)
-
-    logger = None
-    if cfg.wandb.enabled:
-        logger = WandbLogger(**cfg.wandb.config)
-        logger.log_hyperparams(OmegaConf.to_container(cfg))
-
+    run_dir = Path(cfg.cache_dir, run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
-    with open(run_dir / "config.yaml", "w") as f:
+
+    with open(run_dir / "config.yaml", "w", encoding="utf-8") as f:
         OmegaConf.save(cfg, f)
 
-    object_dump_callback = ModelObjectCallBack(
-        dirpath=run_dir, filename=cfg.output_model_name, epoch_interval=1,
+    artifact_saver = ModelArtifactSaver(
+        dirpath=run_dir, filename=cfg.output_model_name, epoch_interval=1
     )
+    metrics_logger = JsonlLogger(run_dir / "metrics.jsonl")
 
-    trainer = pl.Trainer(
-        **cfg.trainer,
-        callbacks=[object_dump_callback],
-        num_sanity_val_steps=1,
-        logger=logger,
-        enable_checkpointing=True,
-    )
+    max_epochs = int(cfg.trainer.max_epochs)
+    log_interval = max(1, int(cfg.logging.get("log_interval", 1)))
+    for epoch in range(1, max_epochs + 1):
+        train_metrics = train_one_epoch(
+            model=model,
+            sigreg=sigreg,
+            loader=train_loader,
+            optimizer=optimizer,
+            scaler=scaler,
+            device=device,
+            amp_dtype=amp_dtype,
+            cfg=cfg,
+        )
+        val_metrics = evaluate(
+            model=model,
+            sigreg=sigreg,
+            loader=val_loader,
+            device=device,
+            amp_dtype=amp_dtype,
+            cfg=cfg,
+        )
+        maybe_step_scheduler(scheduler)
 
-    manager = spt.Manager(
-        trainer=trainer,
-        module=world_model,
-        data=data_module,
-        ckpt_path=run_dir / f"{cfg.output_model_name}_weights.ckpt",
-    )
+        current_lr = optimizer.param_groups[0]["lr"]
+        metrics = {
+            "epoch": epoch,
+            "lr": current_lr,
+            "train/loss": train_metrics["loss"],
+            "train/pred_loss": train_metrics["pred_loss"],
+            "train/sigreg_loss": train_metrics["sigreg_loss"],
+            "val/loss": val_metrics["loss"],
+            "val/pred_loss": val_metrics["pred_loss"],
+            "val/sigreg_loss": val_metrics["sigreg_loss"],
+        }
+        metrics_logger.log(metrics)
+        artifact_saver.save_epoch(model=model, epoch=epoch, max_epochs=max_epochs)
 
-    manager()
-    return
+        if epoch % log_interval == 0 or epoch == 1 or epoch == max_epochs:
+            print(
+                f"epoch {epoch}/{max_epochs} "
+                f"train_loss={train_metrics['loss']:.6f} "
+                f"val_loss={val_metrics['loss']:.6f} "
+                f"lr={current_lr:.6e}"
+            )
+
+    artifact_saver.save_final(model=model)
 
 
 if __name__ == "__main__":
