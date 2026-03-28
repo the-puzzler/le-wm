@@ -16,6 +16,8 @@ trainer:
   gradient_clip_val: 1.0
 logging:
   log_interval: 1
+  plot_interval: 1
+  step_interval: 1000
 loader:
   batch_size: 16
   num_workers: ${num_workers}

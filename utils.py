@@ -1,8 +1,9 @@
-import numpy as np
-import torch
 import json
 import csv
 from pathlib import Path
+
+import numpy as np
+import torch
 from stable_pretraining import data as dt
 import matplotlib
 
@@ -102,18 +103,37 @@ class TsvLogger:
             else:
                 serializable[key] = value
 
+        incoming_fields = list(serializable.keys())
         if self._fieldnames is None:
-            self._fieldnames = list(serializable.keys())
+            self._fieldnames = incoming_fields
             if self.path.exists() and self.path.stat().st_size > 0:
                 with self.path.open("r", encoding="utf-8", newline="") as f:
                     reader = csv.reader(f, delimiter="\t")
                     self._fieldnames = next(reader)
+        elif any(field not in self._fieldnames for field in incoming_fields):
+            self._fieldnames = self._fieldnames + [
+                field for field in incoming_fields if field not in self._fieldnames
+            ]
+            self._rewrite_with_fieldnames()
 
         with self.path.open("a", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=self._fieldnames, delimiter="\t")
             if f.tell() == 0:
                 writer.writeheader()
             writer.writerow({k: serializable.get(k, "") for k in self._fieldnames})
+
+    def _rewrite_with_fieldnames(self):
+        if not self.path.exists() or self.path.stat().st_size == 0:
+            return
+
+        with self.path.open("r", encoding="utf-8", newline="") as f:
+            rows = list(csv.DictReader(f, delimiter="\t"))
+
+        with self.path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self._fieldnames, delimiter="\t")
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({k: row.get(k, "") for k in self._fieldnames})
 
 
 def save_training_plots(history: list[dict], output_path):
@@ -124,7 +144,8 @@ def save_training_plots(history: list[dict], output_path):
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    epochs = [row["epoch"] for row in history]
+    x_values = [row.get("global_step", row["epoch"]) for row in history]
+    x_label = "Global Step" if any("global_step" in row for row in history) else "Epoch"
     fig, axes = plt.subplots(2, 3, figsize=(14, 8), sharex=True)
     axes = axes.ravel()
 
@@ -138,13 +159,28 @@ def save_training_plots(history: list[dict], output_path):
     ]
 
     for ax, (title, train_key, val_key) in zip(axes, plots):
-        ax.plot(epochs, [row[train_key] for row in history], label=train_key, linewidth=2)
+        train_points = [(x, row[train_key]) for x, row in zip(x_values, history) if row.get(train_key) is not None]
+        if train_points:
+            ax.plot(
+                [x for x, _ in train_points],
+                [value for _, value in train_points],
+                label=train_key,
+                linewidth=2,
+            )
         if val_key is not None:
-            ax.plot(epochs, [row[val_key] for row in history], label=val_key, linewidth=2)
+            val_points = [(x, row[val_key]) for x, row in zip(x_values, history) if row.get(val_key) is not None]
+            if val_points:
+                ax.plot(
+                    [x for x, _ in val_points],
+                    [value for _, value in val_points],
+                    label=val_key,
+                    linewidth=2,
+                )
         ax.set_title(title)
-        ax.set_xlabel("Epoch")
+        ax.set_xlabel(x_label)
         ax.grid(True, alpha=0.3)
-        ax.legend()
+        if ax.has_data():
+            ax.legend()
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=150)

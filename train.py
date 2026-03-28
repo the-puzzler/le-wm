@@ -100,6 +100,35 @@ def maybe_step_scheduler(scheduler):
         scheduler.step()
 
 
+def make_metrics_payload(
+    *,
+    kind: str,
+    epoch: int,
+    lr: float,
+    train_metrics: dict,
+    val_metrics: dict | None = None,
+    global_step: int | None = None,
+    epoch_step: int | None = None,
+):
+    return {
+        "kind": kind,
+        "epoch": epoch,
+        "epoch_step": epoch_step,
+        "global_step": global_step,
+        "lr": lr,
+        "train/loss": train_metrics["loss"],
+        "train/pred_loss": train_metrics["pred_loss"],
+        "train/sigreg_loss": train_metrics["sigreg_loss"],
+        "train/codebook_loss": train_metrics["codebook_loss"],
+        "train/commitment_loss": train_metrics["commitment_loss"],
+        "val/loss": None if val_metrics is None else val_metrics["loss"],
+        "val/pred_loss": None if val_metrics is None else val_metrics["pred_loss"],
+        "val/sigreg_loss": None if val_metrics is None else val_metrics["sigreg_loss"],
+        "val/codebook_loss": None if val_metrics is None else val_metrics["codebook_loss"],
+        "val/commitment_loss": None if val_metrics is None else val_metrics["commitment_loss"],
+    }
+
+
 def evaluate(model, sigreg, loader, device, amp_dtype, cfg):
     model.eval()
     sigreg.eval()
@@ -152,7 +181,19 @@ def evaluate(model, sigreg, loader, device, amp_dtype, cfg):
     }
 
 
-def train_one_epoch(model, sigreg, loader, optimizer, scaler, device, amp_dtype, cfg):
+def train_one_epoch(
+    model,
+    sigreg,
+    loader,
+    optimizer,
+    scaler,
+    device,
+    amp_dtype,
+    cfg,
+    epoch: int,
+    global_step_start: int = 0,
+    on_step_metrics=None,
+):
     model.train()
     sigreg.train()
 
@@ -164,6 +205,7 @@ def train_one_epoch(model, sigreg, loader, optimizer, scaler, device, amp_dtype,
     total_batches = 0
 
     grad_clip = cfg.trainer.get("gradient_clip_val")
+    step_interval = max(1, int(cfg.logging.get("step_interval", 1000)))
 
     progress = tqdm(loader, desc="train", leave=False)
     for batch_idx, batch in enumerate(progress, start=1):
@@ -202,6 +244,24 @@ def train_one_epoch(model, sigreg, loader, optimizer, scaler, device, amp_dtype,
                 codebook=f"{total_codebook_loss / total_batches:.4f}",
                 commit=f"{total_commitment_loss / total_batches:.4f}",
                 lr=f"{optimizer.param_groups[0]['lr']:.2e}",
+            )
+
+        if on_step_metrics is not None and batch_idx % step_interval == 0:
+            on_step_metrics(
+                make_metrics_payload(
+                    kind="step",
+                    epoch=epoch,
+                    epoch_step=batch_idx,
+                    global_step=global_step_start + batch_idx,
+                    lr=optimizer.param_groups[0]["lr"],
+                    train_metrics={
+                        "loss": total_loss / total_batches,
+                        "pred_loss": total_pred_loss / total_batches,
+                        "sigreg_loss": total_sigreg_loss / total_batches,
+                        "codebook_loss": total_codebook_loss / total_batches,
+                        "commitment_loss": total_commitment_loss / total_batches,
+                    },
+                )
             )
 
     if total_batches == 0:
@@ -342,7 +402,17 @@ def run(cfg):
 
     max_epochs = int(cfg.trainer.max_epochs)
     log_interval = max(1, int(cfg.logging.get("log_interval", 1)))
-    plot_interval = max(1, int(cfg.logging.get("plot_interval", 5)))
+    plot_interval = max(1, int(cfg.logging.get("plot_interval", 1)))
+    global_step = 0
+
+    def persist_metrics(payload: dict, *, update_plot: bool = False):
+        history.append(payload)
+        metrics_logger.log(payload)
+        if tsv_logger is not None:
+            tsv_logger.log(payload)
+        if update_plot:
+            save_training_plots(history, run_dir / "training_curves.png")
+
     for epoch in range(1, max_epochs + 1):
         train_metrics = train_one_epoch(
             model=model,
@@ -353,7 +423,11 @@ def run(cfg):
             device=device,
             amp_dtype=amp_dtype,
             cfg=cfg,
+            epoch=epoch,
+            global_step_start=global_step,
+            on_step_metrics=lambda payload: persist_metrics(payload, update_plot=True),
         )
+        global_step += len(train_loader)
         val_metrics = evaluate(
             model=model,
             sigreg=sigreg,
@@ -365,24 +439,16 @@ def run(cfg):
         maybe_step_scheduler(scheduler)
 
         current_lr = optimizer.param_groups[0]["lr"]
-        metrics = {
-            "epoch": epoch,
-            "lr": current_lr,
-            "train/loss": train_metrics["loss"],
-            "train/pred_loss": train_metrics["pred_loss"],
-            "train/sigreg_loss": train_metrics["sigreg_loss"],
-            "train/codebook_loss": train_metrics["codebook_loss"],
-            "train/commitment_loss": train_metrics["commitment_loss"],
-            "val/loss": val_metrics["loss"],
-            "val/pred_loss": val_metrics["pred_loss"],
-            "val/sigreg_loss": val_metrics["sigreg_loss"],
-            "val/codebook_loss": val_metrics["codebook_loss"],
-            "val/commitment_loss": val_metrics["commitment_loss"],
-        }
-        history.append(metrics)
-        metrics_logger.log(metrics)
-        if tsv_logger is not None:
-            tsv_logger.log(metrics)
+        metrics = make_metrics_payload(
+            kind="epoch",
+            epoch=epoch,
+            epoch_step=len(train_loader),
+            global_step=global_step,
+            lr=current_lr,
+            train_metrics=train_metrics,
+            val_metrics=val_metrics,
+        )
+        persist_metrics(metrics)
         artifact_saver.save_epoch(model=model, epoch=epoch, max_epochs=max_epochs)
         if epoch % plot_interval == 0 or epoch == 1 or epoch == max_epochs:
             save_training_plots(history, run_dir / "training_curves.png")
