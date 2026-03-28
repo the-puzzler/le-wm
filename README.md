@@ -73,14 +73,10 @@ For baseline scripts, see the stable-worldmodel [scripts](https://github.com/gal
 
 ## Planning
 
-Evaluation configs live under `config/eval/`. Set the `policy` field to the checkpoint path **relative to `$STABLEWM_HOME`**, without the `_object.ckpt` suffix:
+Evaluation now uses the plain Python `EVAL_CONFIG` object in [config.py](/home/matteo/Documents/le-wm/config.py). Set `EVAL_CONFIG.policy` to the checkpoint path **relative to `$STABLEWM_HOME`**, without the `_object.ckpt` suffix, then run:
 
 ```bash
-# ✓ correct
-python eval.py --config-name=pusht.yaml policy=pusht/lewm
-
-# ✗ incorrect
-python eval.py --config-name=pusht.yaml policy=pusht/lewm_object.ckpt
+python eval.py
 ```
 
 ## Pretrained Checkpoints

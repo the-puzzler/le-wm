@@ -1,171 +1,188 @@
-from __future__ import annotations
-
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 
-@dataclass
-class DatasetConfig:
-    name: str
-    frameskip: int
-    keys_to_load: list[str]
-    keys_to_cache: list[str]
-    keys_to_merge: dict[str, str] = field(default_factory=dict)
+# =========================
+# Paths
+# =========================
+
+REPO_ROOT = Path(__file__).resolve().parent
+RUNS_DIR = REPO_ROOT / "runs"
+CACHE_DIR = REPO_ROOT / "data" / "stablewm"
 
 
-@dataclass
-class TrainerConfig:
-    max_epochs: int = 100
-    accelerator: str = "gpu"
-    devices: str | int | list[int] = "auto"
-    precision: str = "bf16"
-    gradient_clip_val: float | None = 1.0
+# =========================
+# Training Run
+# =========================
+
+TRAIN_DATASET = "pusht"
+OUTPUT_MODEL_NAME = "lewm"
+RUN_NAME = None
+
+TRAIN_SPLIT = 0.9
+SEED = 3072
+
+IMG_SIZE = 224
+PATCH_SIZE = 14
+ENCODER_SCALE = "tiny"
+
+MAX_EPOCHS = 100
+ACCELERATOR = "gpu"
+DEVICES = "auto"
+PRECISION = "bf16"
+GRADIENT_CLIP_VAL = 1.0
+
+BATCH_SIZE = 16
+NUM_WORKERS = 6
+PERSISTENT_WORKERS = True
+PREFETCH_FACTOR = 3
+PIN_MEMORY = True
+
+OPTIMIZER_NAME = "AdamW"
+LEARNING_RATE = 5e-5
+WEIGHT_DECAY = 1e-3
+
+CONSOLE_EVERY_STEPS = 20
+WRITE_EVERY_STEPS = 100
+PLOT_EVERY_STEPS = 100
+PLOT_EVERY_EPOCHS = 1
+SAVE_TSV = True
+
+HISTORY_SIZE = 3
+NUM_PREDS = 1
+EMBED_DIM = 192
+ACTION_DIM = 2
+USE_LEARNED_ACTIONS = True
+
+NUM_CODES = 8
+CODEBOOK_BETA = 0.25
+
+PREDICTOR_DEPTH = 6
+PREDICTOR_HEADS = 16
+PREDICTOR_MLP_DIM = 2048
+PREDICTOR_DIM_HEAD = 64
+PREDICTOR_DROPOUT = 0.1
+PREDICTOR_EMB_DROPOUT = 0.0
+
+INVERSE_DYNAMICS_DEPTH = 4
+INVERSE_DYNAMICS_HEADS = 8
+INVERSE_DYNAMICS_MLP_DIM = 1024
+INVERSE_DYNAMICS_DIM_HEAD = 64
+INVERSE_DYNAMICS_DROPOUT = 0.1
+INVERSE_DYNAMICS_EMB_DROPOUT = 0.0
+
+SIGREG_WEIGHT = 0.09
+SIGREG_KNOTS = 17
+SIGREG_NUM_PROJ = 1024
+
+CODEBOOK_LOSS_WEIGHT = 1.0
+COMMITMENT_LOSS_WEIGHT = 1.0
 
 
-@dataclass
-class LoggingConfig:
-    console_every_steps: int = 20
-    write_every_steps: int = 100
-    plot_every_steps: int = 100
-    plot_every_epochs: int = 1
-    save_tsv: bool = True
+# =========================
+# Active Train Dataset
+# Change these directly.
+# =========================
+
+DATASET_NAME = "pusht_expert_train"
+DATASET_FRAMESKIP = 5
+DATASET_KEYS_TO_LOAD = ["pixels", "action", "proprio", "state"]
+DATASET_KEYS_TO_CACHE = ["action", "proprio", "state"]
+DATASET_KEYS_TO_MERGE = {}
+
+# Other examples:
+# DATASET_NAME = "tworoom"
+# DATASET_KEYS_TO_LOAD = ["pixels", "action", "proprio"]
+# DATASET_KEYS_TO_CACHE = ["action", "proprio"]
+
+# DATASET_NAME = "reacher"
+# DATASET_KEYS_TO_LOAD = ["pixels", "action", "observation"]
+# DATASET_KEYS_TO_CACHE = ["action", "observation"]
+
+# DATASET_NAME = "ogbench/cube_single_expert"
+# DATASET_KEYS_TO_LOAD = ["pixels", "action", "observation"]
+# DATASET_KEYS_TO_CACHE = ["action", "observation"]
+# DATASET_KEYS_TO_MERGE = {"proprio": "proprio"}
 
 
-@dataclass
-class LoaderConfig:
-    batch_size: int = 16
-    num_workers: int = 6
-    persistent_workers: bool = True
-    prefetch_factor: int = 3
-    pin_memory: bool = True
+# =========================
+# Evaluation
+# =========================
+
+EVAL_POLICY = "random"
+EVAL_SEED = 42
+EVAL_NUM = 50
+EVAL_GOAL_OFFSET_STEPS = 25
+EVAL_BUDGET = 50
+EVAL_IMG_SIZE = 224
+
+PLAN_HORIZON = 5
+PLAN_RECEDING_HORIZON = 5
+PLAN_ACTION_BLOCK = 5
+
+SOLVER_TYPE = "cem"
+SOLVER_BATCH_SIZE = 1
+SOLVER_NUM_SAMPLES = 300
+SOLVER_N_STEPS = 30
+SOLVER_DEVICE = "cuda"
+SOLVER_SEED = 42
+SOLVER_VAR_SCALE = 1.0
+SOLVER_TOPK = 30
+SOLVER_ACTION_NOISE = 0.0
+SOLVER_OPTIMIZER_CLS = "torch.optim.AdamW"
+SOLVER_OPTIMIZER_KWARGS = {"lr": 0.1}
 
 
-@dataclass
-class OptimizerConfig:
-    name: str = "AdamW"
-    lr: float = 5e-5
-    weight_decay: float = 1e-3
+# =========================
+# Active Eval Setup
+# Change these directly.
+# =========================
 
+EVAL_OUTPUT_FILENAME = "pusht_results.txt"
 
-@dataclass
-class WorldModelConfig:
-    history_size: int = 3
-    num_preds: int = 1
-    embed_dim: int = 192
-    action_dim: int = 2
-    use_learned_actions: bool = True
+EVAL_WORLD_ENV_NAME = "swm/PushT-v1"
+EVAL_WORLD_HISTORY_SIZE = 1
+EVAL_WORLD_FRAME_SKIP = 1
+EVAL_WORLD_TASK = None
+EVAL_WORLD_ENV_TYPE = None
+EVAL_WORLD_OB_TYPE = None
+EVAL_WORLD_MULTIVIEW = None
+EVAL_WORLD_WIDTH = None
+EVAL_WORLD_HEIGHT = None
+EVAL_WORLD_VISUALIZE_INFO = None
+EVAL_WORLD_TERMINATE_AT_GOAL = None
 
+EVAL_DATASET_NAME = "pusht_expert_train"
+EVAL_DATASET_KEYS_TO_CACHE = ["action", "proprio", "state"]
 
-@dataclass
-class CodebookConfig:
-    num_codes: int = 8
-    beta: float = 0.25
+EVAL_CALLABLES = [
+    {"method": "_set_state", "args": {"state": {"value": "state"}}},
+    {"method": "_set_goal_state", "args": {"goal_state": {"value": "goal_state"}}},
+]
 
+# Other examples:
+# EVAL_OUTPUT_FILENAME = "tworoom_results.txt"
+# EVAL_WORLD_ENV_NAME = "swm/TwoRoom-v1"
+# EVAL_DATASET_NAME = "tworoom"
+# EVAL_DATASET_KEYS_TO_CACHE = ["action", "proprio"]
+# EVAL_CALLABLES = [
+#     {"method": "_set_state", "args": {"state": {"value": "proprio"}}},
+#     {"method": "_set_goal_state", "args": {"goal_state": {"value": "goal_proprio"}}},
+# ]
 
-@dataclass
-class PredictorConfig:
-    depth: int = 6
-    heads: int = 16
-    mlp_dim: int = 2048
-    dim_head: int = 64
-    dropout: float = 0.1
-    emb_dropout: float = 0.0
+# EVAL_OUTPUT_FILENAME = "dmc_results.txt"
+# EVAL_WORLD_ENV_NAME = "swm/ReacherDMControl-v0"
+# EVAL_WORLD_TASK = "qpos_match"
+# EVAL_DATASET_NAME = "dmc/reacher_random"
+# EVAL_DATASET_KEYS_TO_CACHE = ["action"]
 
-
-@dataclass
-class InverseDynamicsConfig:
-    depth: int = 4
-    heads: int = 8
-    mlp_dim: int = 1024
-    dim_head: int = 64
-    dropout: float = 0.1
-    emb_dropout: float = 0.0
-
-
-@dataclass
-class SigRegConfig:
-    weight: float = 0.09
-    knots: int = 17
-    num_proj: int = 1024
-
-
-@dataclass
-class VQLossConfig:
-    codebook_weight: float = 1.0
-    commitment_weight: float = 1.0
-
-
-@dataclass
-class LossConfig:
-    sigreg: SigRegConfig = field(default_factory=SigRegConfig)
-    vq: VQLossConfig = field(default_factory=VQLossConfig)
-
-
-@dataclass
-class TrainConfig:
-    dataset_preset: str = "pusht"
-    output_model_name: str = "lewm"
-    runs_dir: str = "runs"
-    cache_dir: str | None = None
-    run_name: str | None = None
-    train_split: float = 0.9
-    seed: int = 3072
-    img_size: int = 224
-    patch_size: int = 14
-    encoder_scale: str = "tiny"
-    trainer: TrainerConfig = field(default_factory=TrainerConfig)
-    logging: LoggingConfig = field(default_factory=LoggingConfig)
-    loader: LoaderConfig = field(default_factory=LoaderConfig)
-    optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
-    wm: WorldModelConfig = field(default_factory=WorldModelConfig)
-    codebook: CodebookConfig = field(default_factory=CodebookConfig)
-    predictor: PredictorConfig = field(default_factory=PredictorConfig)
-    inverse_dynamics: InverseDynamicsConfig = field(default_factory=InverseDynamicsConfig)
-    loss: LossConfig = field(default_factory=LossConfig)
-    dataset: DatasetConfig | None = None
-
-
-def dataset_presets(num_steps: int) -> dict[str, DatasetConfig]:
-    return {
-        "pusht": DatasetConfig(
-            name="pusht_expert_train",
-            frameskip=5,
-            keys_to_load=["pixels", "action", "proprio", "state"],
-            keys_to_cache=["action", "proprio", "state"],
-        ),
-        "tworoom": DatasetConfig(
-            name="tworoom",
-            frameskip=5,
-            keys_to_load=["pixels", "action", "proprio"],
-            keys_to_cache=["action", "proprio"],
-        ),
-        "dmc": DatasetConfig(
-            name="reacher",
-            frameskip=5,
-            keys_to_load=["pixels", "action", "observation"],
-            keys_to_cache=["action", "observation"],
-        ),
-        "ogb": DatasetConfig(
-            name="ogbench/cube_single_expert",
-            frameskip=5,
-            keys_to_load=["pixels", "action", "observation"],
-            keys_to_cache=["action", "observation"],
-            keys_to_merge={"proprio": "proprio"},
-        ),
-    }
-
-
-def build_config(dataset_preset: str = "pusht") -> TrainConfig:
-    config = TrainConfig(dataset_preset=dataset_preset)
-    num_steps = config.wm.history_size + config.wm.num_preds
-    presets = dataset_presets(num_steps=num_steps)
-    if dataset_preset not in presets:
-        valid = ", ".join(sorted(presets))
-        raise ValueError(f"Unknown dataset preset '{dataset_preset}'. Expected one of: {valid}")
-    config.dataset = presets[dataset_preset]
-    return config
-
-
-CONFIG = build_config()
-CONFIG.cache_dir = str(Path(__file__).resolve().parent / "data" / "stablewm")
+# EVAL_OUTPUT_FILENAME = "ogb_cube_results.txt"
+# EVAL_WORLD_ENV_NAME = "swm/OGBCube-v0"
+# EVAL_WORLD_ENV_TYPE = "single"
+# EVAL_WORLD_OB_TYPE = "states"
+# EVAL_WORLD_MULTIVIEW = False
+# EVAL_WORLD_WIDTH = 224
+# EVAL_WORLD_HEIGHT = 224
+# EVAL_WORLD_VISUALIZE_INFO = False
+# EVAL_WORLD_TERMINATE_AT_GOAL = True
+# EVAL_DATASET_NAME = "ogbench/cube_single_expert"
+# EVAL_DATASET_KEYS_TO_CACHE = ["action"]

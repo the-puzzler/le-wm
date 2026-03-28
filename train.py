@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
-from config import CONFIG, TrainConfig
+import config as cfg
 from utils import (
     JsonlLogger,
     ModelArtifactSaver,
@@ -15,25 +14,114 @@ from utils import (
     save_training_plots,
 )
 
-def create_run_dir(config: TrainConfig) -> Path:
+
+def build_train_config() -> dict:
+    return {
+        "dataset_preset": cfg.TRAIN_DATASET,
+        "dataset": {
+            "name": cfg.DATASET_NAME,
+            "frameskip": cfg.DATASET_FRAMESKIP,
+            "keys_to_load": list(cfg.DATASET_KEYS_TO_LOAD),
+            "keys_to_cache": list(cfg.DATASET_KEYS_TO_CACHE),
+            "keys_to_merge": dict(cfg.DATASET_KEYS_TO_MERGE),
+        },
+        "output_model_name": cfg.OUTPUT_MODEL_NAME,
+        "runs_dir": Path(cfg.RUNS_DIR),
+        "cache_dir": str(cfg.CACHE_DIR),
+        "run_name": cfg.RUN_NAME,
+        "train_split": cfg.TRAIN_SPLIT,
+        "seed": cfg.SEED,
+        "img_size": cfg.IMG_SIZE,
+        "patch_size": cfg.PATCH_SIZE,
+        "encoder_scale": cfg.ENCODER_SCALE,
+        "trainer": {
+            "max_epochs": cfg.MAX_EPOCHS,
+            "accelerator": cfg.ACCELERATOR,
+            "devices": cfg.DEVICES,
+            "precision": cfg.PRECISION,
+            "gradient_clip_val": cfg.GRADIENT_CLIP_VAL,
+        },
+        "logging": {
+            "console_every_steps": cfg.CONSOLE_EVERY_STEPS,
+            "write_every_steps": cfg.WRITE_EVERY_STEPS,
+            "plot_every_steps": cfg.PLOT_EVERY_STEPS,
+            "plot_every_epochs": cfg.PLOT_EVERY_EPOCHS,
+            "save_tsv": cfg.SAVE_TSV,
+        },
+        "loader": {
+            "batch_size": cfg.BATCH_SIZE,
+            "num_workers": cfg.NUM_WORKERS,
+            "persistent_workers": cfg.PERSISTENT_WORKERS,
+            "prefetch_factor": cfg.PREFETCH_FACTOR,
+            "pin_memory": cfg.PIN_MEMORY,
+        },
+        "optimizer": {
+            "name": cfg.OPTIMIZER_NAME,
+            "lr": cfg.LEARNING_RATE,
+            "weight_decay": cfg.WEIGHT_DECAY,
+        },
+        "wm": {
+            "history_size": cfg.HISTORY_SIZE,
+            "num_preds": cfg.NUM_PREDS,
+            "embed_dim": cfg.EMBED_DIM,
+            "action_dim": cfg.ACTION_DIM,
+            "use_learned_actions": cfg.USE_LEARNED_ACTIONS,
+        },
+        "codebook": {
+            "num_codes": cfg.NUM_CODES,
+            "beta": cfg.CODEBOOK_BETA,
+        },
+        "predictor": {
+            "depth": cfg.PREDICTOR_DEPTH,
+            "heads": cfg.PREDICTOR_HEADS,
+            "mlp_dim": cfg.PREDICTOR_MLP_DIM,
+            "dim_head": cfg.PREDICTOR_DIM_HEAD,
+            "dropout": cfg.PREDICTOR_DROPOUT,
+            "emb_dropout": cfg.PREDICTOR_EMB_DROPOUT,
+        },
+        "inverse_dynamics": {
+            "depth": cfg.INVERSE_DYNAMICS_DEPTH,
+            "heads": cfg.INVERSE_DYNAMICS_HEADS,
+            "mlp_dim": cfg.INVERSE_DYNAMICS_MLP_DIM,
+            "dim_head": cfg.INVERSE_DYNAMICS_DIM_HEAD,
+            "dropout": cfg.INVERSE_DYNAMICS_DROPOUT,
+            "emb_dropout": cfg.INVERSE_DYNAMICS_EMB_DROPOUT,
+        },
+        "loss": {
+            "sigreg": {
+                "weight": cfg.SIGREG_WEIGHT,
+                "knots": cfg.SIGREG_KNOTS,
+                "num_proj": cfg.SIGREG_NUM_PROJ,
+            },
+            "vq": {
+                "codebook_weight": cfg.CODEBOOK_LOSS_WEIGHT,
+                "commitment_weight": cfg.COMMITMENT_LOSS_WEIGHT,
+            },
+        },
+    }
+
+
+def create_run_dir(config: dict) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    suffix = f"-{config.run_name}" if config.run_name else f"-{config.dataset_preset}"
-    run_dir = Path(config.runs_dir) / f"{timestamp}{suffix}"
+    suffix = f"-{config['run_name']}" if config["run_name"] else f"-{config['dataset_preset']}"
+    run_dir = config["runs_dir"] / f"{timestamp}{suffix}"
     run_dir.mkdir(parents=True, exist_ok=False)
     return run_dir
 
 
-def save_run_config(config: TrainConfig, run_dir: Path) -> None:
+def save_run_config(config: dict, run_dir: Path) -> None:
+    serializable = dict(config)
+    serializable["runs_dir"] = str(serializable["runs_dir"])
     with (run_dir / "config.json").open("w", encoding="utf-8") as f:
-        json.dump(asdict(config), f, indent=2)
+        json.dump(serializable, f, indent=2)
 
 
-def lejepa_forward(model, sigreg, batch, config: TrainConfig):
+def lejepa_forward(model, sigreg, batch, config: dict):
     import torch
 
-    ctx_len = config.wm.history_size
-    n_preds = config.wm.num_preds
-    sigreg_weight = config.loss.sigreg.weight
+    ctx_len = config["wm"]["history_size"]
+    n_preds = config["wm"]["num_preds"]
+    sigreg_weight = config["loss"]["sigreg"]["weight"]
 
     batch = dict(batch)
     batch["action"] = torch.nan_to_num(batch["action"], 0.0)
@@ -42,14 +130,14 @@ def lejepa_forward(model, sigreg, batch, config: TrainConfig):
     emb = output["emb"]
     ctx_emb = emb[:, :ctx_len]
 
-    if config.wm.use_learned_actions:
+    if config["wm"]["use_learned_actions"]:
         code_features = model.infer_action_codes(emb[:, : ctx_len + n_preds])
         vq_output = model.quantize_action_codes(code_features[:, :ctx_len])
         ctx_act = vq_output["quantized"]
         output["code_indices"] = vq_output["indices"]
-        output["codebook_loss"] = config.loss.vq.codebook_weight * vq_output["codebook_loss"]
+        output["codebook_loss"] = config["loss"]["vq"]["codebook_weight"] * vq_output["codebook_loss"]
         output["commitment_loss"] = (
-            config.loss.vq.commitment_weight * vq_output["commitment_loss"]
+            config["loss"]["vq"]["commitment_weight"] * vq_output["commitment_loss"]
         )
     else:
         ctx_act = output["act_emb"][:, :ctx_len]
@@ -70,14 +158,14 @@ def lejepa_forward(model, sigreg, batch, config: TrainConfig):
     return output
 
 
-def resolve_device(config: TrainConfig):
+def resolve_device(config: dict):
     import torch
 
-    accelerator = str(config.trainer.accelerator).lower()
+    accelerator = str(config["trainer"]["accelerator"]).lower()
     if accelerator == "cpu":
         return torch.device("cpu")
     if torch.cuda.is_available():
-        devices = config.trainer.devices
+        devices = config["trainer"]["devices"]
         if isinstance(devices, int):
             return torch.device(f"cuda:{devices}")
         if isinstance(devices, str) and devices not in {"auto", ""}:
@@ -110,46 +198,43 @@ def move_batch_to_device(batch, device):
     }
 
 
-def build_dataset(config: TrainConfig):
+def build_dataset(config: dict):
     import stable_pretraining as spt
     import stable_worldmodel as swm
 
-    dataset_cfg = config.dataset
-    if dataset_cfg is None:
-        raise ValueError("Config is missing dataset settings.")
-
-    cache_dir = config.cache_dir or str(swm.data.utils.get_cache_dir())
-    dataset_path = Path(cache_dir) / f"{dataset_cfg.name}.h5"
+    dataset_cfg = config["dataset"]
+    cache_dir = config["cache_dir"] or str(swm.data.utils.get_cache_dir())
+    dataset_path = Path(cache_dir) / f"{dataset_cfg['name']}.h5"
     if not dataset_path.exists():
         raise FileNotFoundError(
             f"Dataset file not found: {dataset_path}\n"
-            f"Set CONFIG.cache_dir in config.py to the directory containing {dataset_cfg.name}.h5, "
-            f"or change CONFIG.dataset_preset to a dataset you already have."
+            f"Set CACHE_DIR in config.py to the directory containing {dataset_cfg['name']}.h5, "
+            f"or change TRAIN_DATASET to a dataset you already have."
         )
 
     dataset = swm.data.HDF5Dataset(
-        name=dataset_cfg.name,
-        num_steps=config.wm.history_size + config.wm.num_preds,
-        frameskip=dataset_cfg.frameskip,
-        keys_to_load=dataset_cfg.keys_to_load,
-        keys_to_cache=dataset_cfg.keys_to_cache,
-        keys_to_merge=dataset_cfg.keys_to_merge,
+        name=dataset_cfg["name"],
+        num_steps=config["wm"]["history_size"] + config["wm"]["num_preds"],
+        frameskip=dataset_cfg["frameskip"],
+        keys_to_load=dataset_cfg["keys_to_load"],
+        keys_to_cache=dataset_cfg["keys_to_cache"],
+        keys_to_merge=dataset_cfg["keys_to_merge"],
         cache_dir=cache_dir,
         transform=None,
     )
 
-    transforms = [get_img_preprocessor(source="pixels", target="pixels", img_size=config.img_size)]
-    for col in dataset_cfg.keys_to_load:
+    transforms = [get_img_preprocessor(source="pixels", target="pixels", img_size=config["img_size"])]
+    for col in dataset_cfg["keys_to_load"]:
         if col.startswith("pixels"):
             continue
         transforms.append(get_column_normalizer(dataset, col, col))
-        setattr(config.wm, f"{col}_dim", dataset.get_dim(col))
+        config["wm"][f"{col}_dim"] = dataset.get_dim(col)
 
     dataset.transform = spt.data.transforms.Compose(*transforms)
     return dataset
 
 
-def build_model(config: TrainConfig):
+def build_model(config: dict):
     import stable_pretraining as spt
     import torch
 
@@ -157,29 +242,29 @@ def build_model(config: TrainConfig):
     from module import ARPredictor, Embedder, InverseDynamicsTransformer, MLP, SIGReg, VectorQuantizer
 
     encoder = spt.backbone.utils.vit_hf(
-        config.encoder_scale,
-        patch_size=config.patch_size,
-        image_size=config.img_size,
+        config["encoder_scale"],
+        patch_size=config["patch_size"],
+        image_size=config["img_size"],
         pretrained=False,
         use_mask_token=False,
     )
     hidden_dim = encoder.config.hidden_size
-    embed_dim = config.wm.embed_dim or hidden_dim
-    effective_act_dim = config.dataset.frameskip * config.wm.action_dim
+    embed_dim = config["wm"]["embed_dim"] or hidden_dim
+    effective_act_dim = config["dataset"]["frameskip"] * config["wm"]["action_dim"]
 
     predictor = ARPredictor(
-        num_frames=config.wm.history_size,
+        num_frames=config["wm"]["history_size"],
         input_dim=embed_dim,
         hidden_dim=hidden_dim,
         output_dim=hidden_dim,
-        **asdict(config.predictor),
+        **config["predictor"],
     )
     inverse_dynamics = InverseDynamicsTransformer(
-        num_frames=config.wm.history_size + config.wm.num_preds,
+        num_frames=config["wm"]["history_size"] + config["wm"]["num_preds"],
         input_dim=embed_dim,
         hidden_dim=hidden_dim,
         output_dim=embed_dim,
-        **asdict(config.inverse_dynamics),
+        **config["inverse_dynamics"],
     )
     action_encoder = Embedder(input_dim=effective_act_dim, emb_dim=embed_dim)
     projector = MLP(
@@ -195,9 +280,9 @@ def build_model(config: TrainConfig):
         norm_fn=torch.nn.BatchNorm1d,
     )
     quantizer = VectorQuantizer(
-        num_codes=config.codebook.num_codes,
+        num_codes=config["codebook"]["num_codes"],
         code_dim=embed_dim,
-        beta=config.codebook.beta,
+        beta=config["codebook"]["beta"],
     )
 
     model = JEPA(
@@ -210,20 +295,20 @@ def build_model(config: TrainConfig):
         quantizer=quantizer,
     )
     sigreg = SIGReg(
-        knots=config.loss.sigreg.knots,
-        num_proj=config.loss.sigreg.num_proj,
+        knots=config["loss"]["sigreg"]["knots"],
+        num_proj=config["loss"]["sigreg"]["num_proj"],
     )
     return model, sigreg
 
 
-def build_optimizer(model, config: TrainConfig):
+def build_optimizer(model, config: dict):
     import torch
 
-    optimizer_cls = getattr(torch.optim, config.optimizer.name)
+    optimizer_cls = getattr(torch.optim, config["optimizer"]["name"])
     return optimizer_cls(
         model.parameters(),
-        lr=config.optimizer.lr,
-        weight_decay=config.optimizer.weight_decay,
+        lr=config["optimizer"]["lr"],
+        weight_decay=config["optimizer"]["weight_decay"],
     )
 
 
@@ -272,7 +357,7 @@ def metrics_row(
     }
 
 
-def evaluate(model, sigreg, loader, device, amp_dtype, config: TrainConfig, epoch: int, global_step: int):
+def evaluate(model, sigreg, loader, device, amp_dtype, config: dict, epoch: int, global_step: int):
     import torch
     from tqdm.auto import tqdm
 
@@ -315,7 +400,7 @@ def train_one_epoch(
     scaler,
     device,
     amp_dtype,
-    config: TrainConfig,
+    config: dict,
     epoch: int,
     global_step_start: int,
     on_step_end,
@@ -330,7 +415,7 @@ def train_one_epoch(
     epoch_totals = empty_metrics()
     running_batches = 0
     epoch_batches = 0
-    grad_clip = config.trainer.gradient_clip_val
+    grad_clip = config["trainer"]["gradient_clip_val"]
 
     progress = tqdm(loader, desc=f"train {epoch}", leave=False)
     for batch_idx, batch in enumerate(progress, start=1):
@@ -380,7 +465,7 @@ def train_one_epoch(
         )
         on_step_end(row, batch_idx=batch_idx)
 
-        if batch_idx % max(1, config.logging.console_every_steps) == 0:
+        if batch_idx % max(1, config["logging"]["console_every_steps"]) == 0:
             averaged = average_metrics(running_totals, running_batches)
             progress.set_postfix(
                 loss=f"{averaged['loss']:.4f}",
@@ -400,28 +485,28 @@ def main():
     import stable_pretraining as spt
     import torch
 
-    config = CONFIG
+    config = build_train_config()
     run_dir = create_run_dir(config)
     save_run_config(config, run_dir)
 
-    torch.manual_seed(config.seed)
+    torch.manual_seed(config["seed"])
     dataset = build_dataset(config)
 
-    generator = torch.Generator().manual_seed(config.seed)
+    generator = torch.Generator().manual_seed(config["seed"])
     train_set, val_set = spt.data.random_split(
         dataset,
-        lengths=[config.train_split, 1 - config.train_split],
+        lengths=[config["train_split"], 1 - config["train_split"]],
         generator=generator,
     )
 
     loader_kwargs = {
-        "batch_size": config.loader.batch_size,
-        "num_workers": config.loader.num_workers,
-        "persistent_workers": config.loader.persistent_workers and config.loader.num_workers > 0,
-        "pin_memory": config.loader.pin_memory,
+        "batch_size": config["loader"]["batch_size"],
+        "num_workers": config["loader"]["num_workers"],
+        "persistent_workers": config["loader"]["persistent_workers"] and config["loader"]["num_workers"] > 0,
+        "pin_memory": config["loader"]["pin_memory"],
     }
-    if config.loader.num_workers > 0:
-        loader_kwargs["prefetch_factor"] = config.loader.prefetch_factor
+    if config["loader"]["num_workers"] > 0:
+        loader_kwargs["prefetch_factor"] = config["loader"]["prefetch_factor"]
 
     train_loader = torch.utils.data.DataLoader(
         train_set,
@@ -439,21 +524,21 @@ def main():
 
     model, sigreg = build_model(config)
     device = resolve_device(config)
-    amp_dtype, use_grad_scaler = resolve_amp(device, config.trainer.precision)
+    amp_dtype, use_grad_scaler = resolve_amp(device, config["trainer"]["precision"])
     model = model.to(device)
     sigreg = sigreg.to(device)
 
     optimizer = build_optimizer(model, config)
-    scheduler = build_scheduler(optimizer, max_epochs=config.trainer.max_epochs)
+    scheduler = build_scheduler(optimizer, max_epochs=config["trainer"]["max_epochs"])
     scaler = torch.amp.GradScaler("cuda", enabled=use_grad_scaler)
 
     metrics_jsonl = JsonlLogger(run_dir / "metrics.jsonl")
-    metrics_tsv = TsvLogger(run_dir / "metrics.tsv") if config.logging.save_tsv else None
+    metrics_tsv = TsvLogger(run_dir / "metrics.tsv") if config["logging"]["save_tsv"] else None
     plot_rows: list[dict] = []
     pending_rows: list[dict] = []
     artifact_saver = ModelArtifactSaver(
         dirpath=run_dir,
-        filename=config.output_model_name,
+        filename=config["output_model_name"],
         epoch_interval=1,
     )
 
@@ -469,13 +554,13 @@ def main():
     def persist_row(row: dict, *, update_plot: bool = False, flush: bool = False):
         pending_rows.append(row)
         plot_rows.append(row)
-        if flush or len(pending_rows) >= max(1, config.logging.write_every_steps):
+        if flush or len(pending_rows) >= max(1, config["logging"]["write_every_steps"]):
             flush_pending_rows()
         if update_plot:
             save_training_plots(plot_rows, run_dir / "training_curves.png")
 
     global_step = 0
-    for epoch in range(1, config.trainer.max_epochs + 1):
+    for epoch in range(1, config["trainer"]["max_epochs"] + 1):
         epoch_train_metrics = train_one_epoch(
             model=model,
             sigreg=sigreg,
@@ -489,8 +574,8 @@ def main():
             global_step_start=global_step,
             on_step_end=lambda row, batch_idx: persist_row(
                 row,
-                update_plot=batch_idx % max(1, config.logging.plot_every_steps) == 0,
-                flush=batch_idx % max(1, config.logging.write_every_steps) == 0,
+                update_plot=batch_idx % max(1, config["logging"]["plot_every_steps"]) == 0,
+                flush=batch_idx % max(1, config["logging"]["write_every_steps"]) == 0,
             ),
         )
         global_step += len(train_loader)
@@ -508,12 +593,12 @@ def main():
         persist_row(val_row, update_plot=True, flush=True)
 
         scheduler.step()
-        artifact_saver.save_epoch(model=model, epoch=epoch, max_epochs=config.trainer.max_epochs)
-        if epoch % max(1, config.logging.plot_every_epochs) == 0:
+        artifact_saver.save_epoch(model=model, epoch=epoch, max_epochs=config["trainer"]["max_epochs"])
+        if epoch % max(1, config["logging"]["plot_every_epochs"]) == 0:
             save_training_plots(plot_rows, run_dir / "training_curves.png")
 
         print(
-            f"epoch {epoch}/{config.trainer.max_epochs} "
+            f"epoch {epoch}/{config['trainer']['max_epochs']} "
             f"train_loss={epoch_train_metrics['loss']:.6f} "
             f"val_loss={val_row['loss']:.6f} "
             f"step={global_step}"
