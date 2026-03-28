@@ -313,10 +313,13 @@ def build_optimizer(model, config: dict):
     )
 
 
-def build_scheduler(optimizer, max_epochs: int):
+def build_scheduler(optimizer, total_train_steps: int):
     import torch
 
-    return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs)
+    return torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=max(1, total_train_steps),
+    )
 
 
 def maybe_compile_model(model, config: dict):
@@ -413,6 +416,7 @@ def train_one_epoch(
     sigreg,
     loader,
     optimizer,
+    scheduler,
     scaler,
     device,
     amp_dtype,
@@ -455,6 +459,8 @@ def train_one_epoch(
             if grad_clip is not None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
 
         step_metrics = {
             "loss": output["loss"].detach().item(),
@@ -546,7 +552,8 @@ def main():
     sigreg = sigreg.to(device)
 
     optimizer = build_optimizer(model, config)
-    scheduler = build_scheduler(optimizer, max_epochs=config["trainer"]["max_epochs"])
+    total_train_steps = config["trainer"]["max_epochs"] * len(train_loader)
+    scheduler = build_scheduler(optimizer, total_train_steps=total_train_steps)
     scaler = torch.amp.GradScaler("cuda", enabled=use_grad_scaler)
 
     metrics_jsonl = JsonlLogger(run_dir / "metrics.jsonl")
@@ -583,6 +590,7 @@ def main():
             sigreg=sigreg,
             loader=train_loader,
             optimizer=optimizer,
+            scheduler=scheduler,
             scaler=scaler,
             device=device,
             amp_dtype=amp_dtype,
@@ -609,7 +617,6 @@ def main():
         )
         persist_row(val_row, update_plot=True, flush=True)
 
-        scheduler.step()
         artifact_saver.save_epoch(model=model, epoch=epoch, max_epochs=config["trainer"]["max_epochs"])
         if epoch % max(1, config["logging"]["plot_every_epochs"]) == 0:
             save_training_plots(plot_rows, run_dir / "training_curves.png")
