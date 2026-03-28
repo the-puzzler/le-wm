@@ -1,16 +1,24 @@
+import os
 import json
 import csv
 from pathlib import Path
 
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
+
 import numpy as np
-import torch
-from stable_pretraining import data as dt
 import matplotlib
+
+try:
+    import torch
+except ModuleNotFoundError:  # pragma: no cover - lets CLI load before deps are installed.
+    torch = None
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 def get_img_preprocessor(source: str, target: str, img_size: int = 224):
+    from stable_pretraining import data as dt
+
     imagenet_stats = dt.dataset_stats.ImageNet
     to_image = dt.transforms.ToImage(**imagenet_stats, source=source, target=target)
     resize = dt.transforms.Resize(img_size, source=source, target=target)
@@ -19,6 +27,9 @@ def get_img_preprocessor(source: str, target: str, img_size: int = 224):
 
 def get_column_normalizer(dataset, source: str, target: str):
     """Get normalizer for a specific column in the dataset."""
+    from stable_pretraining import data as dt
+    import torch
+
     col_data = dataset.get_col_data(source)
     data = torch.from_numpy(np.array(col_data))
     data = data[~torch.isnan(data).any(dim=1)]
@@ -74,7 +85,7 @@ class JsonlLogger:
     def log(self, payload: dict):
         serializable = {}
         for key, value in payload.items():
-            if isinstance(value, torch.Tensor):
+            if torch is not None and isinstance(value, torch.Tensor):
                 serializable[key] = float(value.detach().cpu().item())
             elif isinstance(value, np.generic):
                 serializable[key] = value.item()
@@ -96,7 +107,7 @@ class TsvLogger:
     def log(self, payload: dict):
         serializable = {}
         for key, value in payload.items():
-            if isinstance(value, torch.Tensor):
+            if torch is not None and isinstance(value, torch.Tensor):
                 serializable[key] = float(value.detach().cpu().item())
             elif isinstance(value, np.generic):
                 serializable[key] = value.item()
@@ -137,47 +148,53 @@ class TsvLogger:
 
 
 def save_training_plots(history: list[dict], output_path):
-    """Save a compact training dashboard with loss subplots."""
+    """Save training curves from per-step train rows and per-epoch validation rows."""
     if not history:
         return
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    x_values = [row.get("global_step", row["epoch"]) for row in history]
-    x_label = "Global Step" if any("global_step" in row for row in history) else "Epoch"
+    train_rows = [row for row in history if row.get("split") == "train"]
+    val_rows = [row for row in history if row.get("split") == "val"]
+    if not train_rows and not val_rows:
+        return
+
+    train_steps = [row["global_step"] for row in train_rows]
+    val_steps = [row["global_step"] for row in val_rows]
     fig, axes = plt.subplots(2, 3, figsize=(14, 8), sharex=True)
     axes = axes.ravel()
 
     plots = [
-        ("Total Loss", "train/loss", "val/loss"),
-        ("Prediction Loss", "train/pred_loss", "val/pred_loss"),
-        ("SIGReg Loss", "train/sigreg_loss", "val/sigreg_loss"),
-        ("Codebook Loss", "train/codebook_loss", "val/codebook_loss"),
-        ("Commitment Loss", "train/commitment_loss", "val/commitment_loss"),
+        ("Total Loss", "loss"),
+        ("Prediction Loss", "pred_loss"),
+        ("SIGReg Loss", "sigreg_loss"),
+        ("Codebook Loss", "codebook_loss"),
+        ("Commitment Loss", "commitment_loss"),
         ("Learning Rate", "lr", None),
     ]
 
-    for ax, (title, train_key, val_key) in zip(axes, plots):
-        train_points = [(x, row[train_key]) for x, row in zip(x_values, history) if row.get(train_key) is not None]
-        if train_points:
+    for ax, plot_spec in zip(axes, plots):
+        title = plot_spec[0]
+        metric_key = plot_spec[1]
+
+        if train_rows:
             ax.plot(
-                [x for x, _ in train_points],
-                [value for _, value in train_points],
-                label=train_key,
-                linewidth=2,
+                train_steps,
+                [row[metric_key] for row in train_rows],
+                label=f"train/{metric_key}",
+                linewidth=1.5,
             )
-        if val_key is not None:
-            val_points = [(x, row[val_key]) for x, row in zip(x_values, history) if row.get(val_key) is not None]
-            if val_points:
-                ax.plot(
-                    [x for x, _ in val_points],
-                    [value for _, value in val_points],
-                    label=val_key,
-                    linewidth=2,
-                )
+        if val_rows and metric_key != "lr":
+            ax.plot(
+                val_steps,
+                [row[metric_key] for row in val_rows],
+                label=f"val/{metric_key}",
+                linewidth=2.0,
+                marker="o",
+            )
         ax.set_title(title)
-        ax.set_xlabel(x_label)
+        ax.set_xlabel("Global Step")
         ax.grid(True, alpha=0.3)
         if ax.has_data():
             ax.legend()

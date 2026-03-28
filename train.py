@@ -1,14 +1,11 @@
+from __future__ import annotations
+
+import json
+from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 
-import hydra
-import stable_pretraining as spt
-import stable_worldmodel as swm
-import torch
-from omegaconf import OmegaConf, open_dict
-from tqdm.auto import tqdm
-
-from jepa import JEPA
-from module import ARPredictor, Embedder, InverseDynamicsTransformer, MLP, SIGReg, VectorQuantizer
+from config import CONFIG, TrainConfig
 from utils import (
     JsonlLogger,
     ModelArtifactSaver,
@@ -18,32 +15,44 @@ from utils import (
     save_training_plots,
 )
 
+def create_run_dir(config: TrainConfig) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    suffix = f"-{config.run_name}" if config.run_name else f"-{config.dataset_preset}"
+    run_dir = Path(config.runs_dir) / f"{timestamp}{suffix}"
+    run_dir.mkdir(parents=True, exist_ok=False)
+    return run_dir
 
-def lejepa_forward(model, sigreg, batch, cfg):
-    """Encode observations, predict next states, and compute losses."""
 
-    ctx_len = cfg.wm.history_size
-    n_preds = cfg.wm.num_preds
-    lambd = cfg.loss.sigreg.weight
+def save_run_config(config: TrainConfig, run_dir: Path) -> None:
+    with (run_dir / "config.json").open("w", encoding="utf-8") as f:
+        json.dump(asdict(config), f, indent=2)
+
+
+def lejepa_forward(model, sigreg, batch, config: TrainConfig):
+    import torch
+
+    ctx_len = config.wm.history_size
+    n_preds = config.wm.num_preds
+    sigreg_weight = config.loss.sigreg.weight
 
     batch = dict(batch)
     batch["action"] = torch.nan_to_num(batch["action"], 0.0)
 
     output = model.encode(batch)
-
     emb = output["emb"]
-
     ctx_emb = emb[:, :ctx_len]
-    if cfg.wm.use_learned_actions:
+
+    if config.wm.use_learned_actions:
         code_features = model.infer_action_codes(emb[:, : ctx_len + n_preds])
         vq_output = model.quantize_action_codes(code_features[:, :ctx_len])
         ctx_act = vq_output["quantized"]
         output["code_indices"] = vq_output["indices"]
-        output["codebook_loss"] = cfg.loss.vq.codebook_weight * vq_output["codebook_loss"]
-        output["commitment_loss"] = cfg.loss.vq.commitment_weight * vq_output["commitment_loss"]
+        output["codebook_loss"] = config.loss.vq.codebook_weight * vq_output["codebook_loss"]
+        output["commitment_loss"] = (
+            config.loss.vq.commitment_weight * vq_output["commitment_loss"]
+        )
     else:
-        act_emb = output["act_emb"]
-        ctx_act = act_emb[:, :ctx_len]
+        ctx_act = output["act_emb"][:, :ctx_len]
         output["codebook_loss"] = emb.new_zeros(())
         output["commitment_loss"] = emb.new_zeros(())
 
@@ -54,21 +63,23 @@ def lejepa_forward(model, sigreg, batch, cfg):
     output["sigreg_loss"] = sigreg(emb.transpose(0, 1))
     output["loss"] = (
         output["pred_loss"]
-        + lambd * output["sigreg_loss"]
+        + sigreg_weight * output["sigreg_loss"]
         + output["codebook_loss"]
         + output["commitment_loss"]
     )
     return output
 
 
-def resolve_device(cfg):
-    accelerator = str(cfg.trainer.get("accelerator", "auto")).lower()
+def resolve_device(config: TrainConfig):
+    import torch
+
+    accelerator = str(config.trainer.accelerator).lower()
     if accelerator == "cpu":
         return torch.device("cpu")
     if torch.cuda.is_available():
-        devices = cfg.trainer.get("devices", "auto")
+        devices = config.trainer.devices
         if isinstance(devices, int):
-            return torch.device("cuda:0")
+            return torch.device(f"cuda:{devices}")
         if isinstance(devices, str) and devices not in {"auto", ""}:
             return torch.device(f"cuda:{int(devices.split(',')[0])}")
         if isinstance(devices, (list, tuple)) and devices:
@@ -77,7 +88,9 @@ def resolve_device(cfg):
     return torch.device("cpu")
 
 
-def resolve_amp(device, precision):
+def resolve_amp(device, precision: str):
+    import torch
+
     precision = str(precision).lower()
     if device.type != "cuda":
         return None, False
@@ -89,257 +102,84 @@ def resolve_amp(device, precision):
 
 
 def move_batch_to_device(batch, device):
-    moved = {}
-    for key, value in batch.items():
-        moved[key] = value.to(device, non_blocking=True) if torch.is_tensor(value) else value
-    return moved
+    import torch
 
-
-def maybe_step_scheduler(scheduler):
-    if scheduler is not None:
-        scheduler.step()
-
-
-def make_metrics_payload(
-    *,
-    kind: str,
-    epoch: int,
-    lr: float,
-    train_metrics: dict,
-    val_metrics: dict | None = None,
-    global_step: int | None = None,
-    epoch_step: int | None = None,
-):
     return {
-        "kind": kind,
-        "epoch": epoch,
-        "epoch_step": epoch_step,
-        "global_step": global_step,
-        "lr": lr,
-        "train/loss": train_metrics["loss"],
-        "train/pred_loss": train_metrics["pred_loss"],
-        "train/sigreg_loss": train_metrics["sigreg_loss"],
-        "train/codebook_loss": train_metrics["codebook_loss"],
-        "train/commitment_loss": train_metrics["commitment_loss"],
-        "val/loss": None if val_metrics is None else val_metrics["loss"],
-        "val/pred_loss": None if val_metrics is None else val_metrics["pred_loss"],
-        "val/sigreg_loss": None if val_metrics is None else val_metrics["sigreg_loss"],
-        "val/codebook_loss": None if val_metrics is None else val_metrics["codebook_loss"],
-        "val/commitment_loss": None if val_metrics is None else val_metrics["commitment_loss"],
+        key: value.to(device, non_blocking=True) if torch.is_tensor(value) else value
+        for key, value in batch.items()
     }
 
 
-def evaluate(model, sigreg, loader, device, amp_dtype, cfg):
-    model.eval()
-    sigreg.eval()
+def build_dataset(config: TrainConfig):
+    import stable_pretraining as spt
+    import stable_worldmodel as swm
 
-    total_loss = 0.0
-    total_pred_loss = 0.0
-    total_sigreg_loss = 0.0
-    total_codebook_loss = 0.0
-    total_commitment_loss = 0.0
-    total_batches = 0
+    dataset_cfg = config.dataset
+    if dataset_cfg is None:
+        raise ValueError("Config is missing dataset settings.")
 
-    progress = tqdm(loader, desc="val", leave=False)
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(progress, start=1):
-            batch = move_batch_to_device(batch, device)
-            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
-                output = lejepa_forward(model, sigreg, batch, cfg)
+    cache_dir = config.cache_dir or str(swm.data.utils.get_cache_dir())
+    dataset_path = Path(cache_dir) / f"{dataset_cfg.name}.h5"
+    if not dataset_path.exists():
+        raise FileNotFoundError(
+            f"Dataset file not found: {dataset_path}\n"
+            f"Set CONFIG.cache_dir in config.py to the directory containing {dataset_cfg.name}.h5, "
+            f"or change CONFIG.dataset_preset to a dataset you already have."
+        )
 
-            total_loss += output["loss"].detach().item()
-            total_pred_loss += output["pred_loss"].detach().item()
-            total_sigreg_loss += output["sigreg_loss"].detach().item()
-            total_codebook_loss += output["codebook_loss"].detach().item()
-            total_commitment_loss += output["commitment_loss"].detach().item()
-            total_batches += 1
-
-            if batch_idx % max(1, int(cfg.logging.get("log_interval", 1))) == 0:
-                progress.set_postfix(
-                    loss=f"{total_loss / total_batches:.4f}",
-                    pred=f"{total_pred_loss / total_batches:.4f}",
-                    sigreg=f"{total_sigreg_loss / total_batches:.4f}",
-                    codebook=f"{total_codebook_loss / total_batches:.4f}",
-                    commit=f"{total_commitment_loss / total_batches:.4f}",
-                )
-
-    if total_batches == 0:
-        return {
-            "loss": 0.0,
-            "pred_loss": 0.0,
-            "sigreg_loss": 0.0,
-            "codebook_loss": 0.0,
-            "commitment_loss": 0.0,
-        }
-
-    return {
-        "loss": total_loss / total_batches,
-        "pred_loss": total_pred_loss / total_batches,
-        "sigreg_loss": total_sigreg_loss / total_batches,
-        "codebook_loss": total_codebook_loss / total_batches,
-        "commitment_loss": total_commitment_loss / total_batches,
-    }
-
-
-def train_one_epoch(
-    model,
-    sigreg,
-    loader,
-    optimizer,
-    scaler,
-    device,
-    amp_dtype,
-    cfg,
-    epoch: int,
-    global_step_start: int = 0,
-    on_step_metrics=None,
-):
-    model.train()
-    sigreg.train()
-
-    total_loss = 0.0
-    total_pred_loss = 0.0
-    total_sigreg_loss = 0.0
-    total_codebook_loss = 0.0
-    total_commitment_loss = 0.0
-    total_batches = 0
-
-    grad_clip = cfg.trainer.get("gradient_clip_val")
-    step_interval = max(1, int(cfg.logging.get("step_interval", 1000)))
-
-    progress = tqdm(loader, desc="train", leave=False)
-    for batch_idx, batch in enumerate(progress, start=1):
-        batch = move_batch_to_device(batch, device)
-        optimizer.zero_grad(set_to_none=True)
-
-        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
-            output = lejepa_forward(model, sigreg, batch, cfg)
-            loss = output["loss"]
-
-        if scaler is not None:
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            if grad_clip is not None:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            loss.backward()
-            if grad_clip is not None:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
-
-        total_loss += output["loss"].detach().item()
-        total_pred_loss += output["pred_loss"].detach().item()
-        total_sigreg_loss += output["sigreg_loss"].detach().item()
-        total_codebook_loss += output["codebook_loss"].detach().item()
-        total_commitment_loss += output["commitment_loss"].detach().item()
-        total_batches += 1
-
-        if batch_idx % max(1, int(cfg.logging.get("log_interval", 1))) == 0:
-            progress.set_postfix(
-                loss=f"{total_loss / total_batches:.4f}",
-                pred=f"{total_pred_loss / total_batches:.4f}",
-                sigreg=f"{total_sigreg_loss / total_batches:.4f}",
-                codebook=f"{total_codebook_loss / total_batches:.4f}",
-                commit=f"{total_commitment_loss / total_batches:.4f}",
-                lr=f"{optimizer.param_groups[0]['lr']:.2e}",
-            )
-
-        if on_step_metrics is not None and batch_idx % step_interval == 0:
-            on_step_metrics(
-                make_metrics_payload(
-                    kind="step",
-                    epoch=epoch,
-                    epoch_step=batch_idx,
-                    global_step=global_step_start + batch_idx,
-                    lr=optimizer.param_groups[0]["lr"],
-                    train_metrics={
-                        "loss": total_loss / total_batches,
-                        "pred_loss": total_pred_loss / total_batches,
-                        "sigreg_loss": total_sigreg_loss / total_batches,
-                        "codebook_loss": total_codebook_loss / total_batches,
-                        "commitment_loss": total_commitment_loss / total_batches,
-                    },
-                )
-            )
-
-    if total_batches == 0:
-        return {
-            "loss": 0.0,
-            "pred_loss": 0.0,
-            "sigreg_loss": 0.0,
-            "codebook_loss": 0.0,
-            "commitment_loss": 0.0,
-        }
-
-    return {
-        "loss": total_loss / total_batches,
-        "pred_loss": total_pred_loss / total_batches,
-        "sigreg_loss": total_sigreg_loss / total_batches,
-        "codebook_loss": total_codebook_loss / total_batches,
-        "commitment_loss": total_commitment_loss / total_batches,
-    }
-
-
-def build_scheduler(optimizer, max_epochs: int):
-    return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs)
-
-
-@hydra.main(version_base=None, config_path="./config/train", config_name="lewm")
-def run(cfg):
-    dataset = swm.data.HDF5Dataset(**cfg.data.dataset, cache_dir=cfg.cache_dir, transform=None)
-    transforms = [get_img_preprocessor(source="pixels", target="pixels", img_size=cfg.img_size)]
-
-    with open_dict(cfg):
-        for col in cfg.data.dataset.keys_to_load:
-            if col.startswith("pixels"):
-                continue
-
-            normalizer = get_column_normalizer(dataset, col, col)
-            transforms.append(normalizer)
-            setattr(cfg.wm, f"{col}_dim", dataset.get_dim(col))
-
-    transform = spt.data.transforms.Compose(*transforms)
-    dataset.transform = transform
-
-    rnd_gen = torch.Generator().manual_seed(cfg.seed)
-    train_set, val_set = spt.data.random_split(
-        dataset, lengths=[cfg.train_split, 1 - cfg.train_split], generator=rnd_gen
+    dataset = swm.data.HDF5Dataset(
+        name=dataset_cfg.name,
+        num_steps=config.wm.history_size + config.wm.num_preds,
+        frameskip=dataset_cfg.frameskip,
+        keys_to_load=dataset_cfg.keys_to_load,
+        keys_to_cache=dataset_cfg.keys_to_cache,
+        keys_to_merge=dataset_cfg.keys_to_merge,
+        cache_dir=cache_dir,
+        transform=None,
     )
 
-    train_loader = torch.utils.data.DataLoader(
-        train_set, **cfg.loader, shuffle=True, drop_last=True, generator=rnd_gen
-    )
-    val_loader = torch.utils.data.DataLoader(
-        val_set, **cfg.loader, shuffle=False, drop_last=False
-    )
+    transforms = [get_img_preprocessor(source="pixels", target="pixels", img_size=config.img_size)]
+    for col in dataset_cfg.keys_to_load:
+        if col.startswith("pixels"):
+            continue
+        transforms.append(get_column_normalizer(dataset, col, col))
+        setattr(config.wm, f"{col}_dim", dataset.get_dim(col))
+
+    dataset.transform = spt.data.transforms.Compose(*transforms)
+    return dataset
+
+
+def build_model(config: TrainConfig):
+    import stable_pretraining as spt
+    import torch
+
+    from jepa import JEPA
+    from module import ARPredictor, Embedder, InverseDynamicsTransformer, MLP, SIGReg, VectorQuantizer
 
     encoder = spt.backbone.utils.vit_hf(
-        cfg.encoder_scale,
-        patch_size=cfg.patch_size,
-        image_size=cfg.img_size,
+        config.encoder_scale,
+        patch_size=config.patch_size,
+        image_size=config.img_size,
         pretrained=False,
         use_mask_token=False,
     )
-
     hidden_dim = encoder.config.hidden_size
-    embed_dim = cfg.wm.get("embed_dim", hidden_dim)
-    effective_act_dim = cfg.data.dataset.frameskip * cfg.wm.action_dim
+    embed_dim = config.wm.embed_dim or hidden_dim
+    effective_act_dim = config.dataset.frameskip * config.wm.action_dim
 
     predictor = ARPredictor(
-        num_frames=cfg.wm.history_size,
+        num_frames=config.wm.history_size,
         input_dim=embed_dim,
         hidden_dim=hidden_dim,
         output_dim=hidden_dim,
-        **cfg.predictor,
+        **asdict(config.predictor),
     )
     inverse_dynamics = InverseDynamicsTransformer(
-        num_frames=cfg.wm.history_size + cfg.wm.num_preds,
+        num_frames=config.wm.history_size + config.wm.num_preds,
         input_dim=embed_dim,
         hidden_dim=hidden_dim,
         output_dim=embed_dim,
-        **cfg.inverse_dynamics,
+        **asdict(config.inverse_dynamics),
     )
     action_encoder = Embedder(input_dim=effective_act_dim, emb_dim=embed_dim)
     projector = MLP(
@@ -355,9 +195,9 @@ def run(cfg):
         norm_fn=torch.nn.BatchNorm1d,
     )
     quantizer = VectorQuantizer(
-        num_codes=cfg.codebook.num_codes,
+        num_codes=config.codebook.num_codes,
         code_dim=embed_dim,
-        beta=cfg.codebook.beta,
+        beta=config.codebook.beta,
     )
 
     model = JEPA(
@@ -369,52 +209,274 @@ def run(cfg):
         inverse_dynamics=inverse_dynamics,
         quantizer=quantizer,
     )
-    sigreg = SIGReg(**cfg.loss.sigreg.kwargs)
+    sigreg = SIGReg(
+        knots=config.loss.sigreg.knots,
+        num_proj=config.loss.sigreg.num_proj,
+    )
+    return model, sigreg
 
-    device = resolve_device(cfg)
-    amp_dtype, use_grad_scaler = resolve_amp(device, cfg.trainer.get("precision", "32"))
+
+def build_optimizer(model, config: TrainConfig):
+    import torch
+
+    optimizer_cls = getattr(torch.optim, config.optimizer.name)
+    return optimizer_cls(
+        model.parameters(),
+        lr=config.optimizer.lr,
+        weight_decay=config.optimizer.weight_decay,
+    )
+
+
+def build_scheduler(optimizer, max_epochs: int):
+    import torch
+
+    return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs)
+
+
+def empty_metrics() -> dict[str, float]:
+    return {
+        "loss": 0.0,
+        "pred_loss": 0.0,
+        "sigreg_loss": 0.0,
+        "codebook_loss": 0.0,
+        "commitment_loss": 0.0,
+    }
+
+
+def average_metrics(totals: dict[str, float], count: int) -> dict[str, float]:
+    if count == 0:
+        return empty_metrics()
+    return {key: value / count for key, value in totals.items()}
+
+
+def metrics_row(
+    *,
+    split: str,
+    epoch: int,
+    epoch_step: int,
+    global_step: int,
+    lr: float | None,
+    metrics: dict[str, float],
+) -> dict[str, float | int | str | None]:
+    return {
+        "split": split,
+        "epoch": epoch,
+        "epoch_step": epoch_step,
+        "global_step": global_step,
+        "lr": lr,
+        "loss": metrics["loss"],
+        "pred_loss": metrics["pred_loss"],
+        "sigreg_loss": metrics["sigreg_loss"],
+        "codebook_loss": metrics["codebook_loss"],
+        "commitment_loss": metrics["commitment_loss"],
+    }
+
+
+def evaluate(model, sigreg, loader, device, amp_dtype, config: TrainConfig, epoch: int, global_step: int):
+    import torch
+    from tqdm.auto import tqdm
+
+    model.eval()
+    sigreg.eval()
+
+    totals = empty_metrics()
+    total_batches = 0
+
+    progress = tqdm(loader, desc=f"val {epoch}", leave=False)
+    with torch.no_grad():
+        for batch in progress:
+            batch = move_batch_to_device(batch, device)
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
+                output = lejepa_forward(model, sigreg, batch, config)
+
+            totals["loss"] += output["loss"].detach().item()
+            totals["pred_loss"] += output["pred_loss"].detach().item()
+            totals["sigreg_loss"] += output["sigreg_loss"].detach().item()
+            totals["codebook_loss"] += output["codebook_loss"].detach().item()
+            totals["commitment_loss"] += output["commitment_loss"].detach().item()
+            total_batches += 1
+
+    return metrics_row(
+        split="val",
+        epoch=epoch,
+        epoch_step=0,
+        global_step=global_step,
+        lr=None,
+        metrics=average_metrics(totals, total_batches),
+    )
+
+
+def train_one_epoch(
+    *,
+    model,
+    sigreg,
+    loader,
+    optimizer,
+    scaler,
+    device,
+    amp_dtype,
+    config: TrainConfig,
+    epoch: int,
+    global_step_start: int,
+    on_step_end,
+):
+    import torch
+    from tqdm.auto import tqdm
+
+    model.train()
+    sigreg.train()
+
+    running_totals = empty_metrics()
+    epoch_totals = empty_metrics()
+    running_batches = 0
+    epoch_batches = 0
+    grad_clip = config.trainer.gradient_clip_val
+
+    progress = tqdm(loader, desc=f"train {epoch}", leave=False)
+    for batch_idx, batch in enumerate(progress, start=1):
+        global_step = global_step_start + batch_idx
+        batch = move_batch_to_device(batch, device)
+        optimizer.zero_grad(set_to_none=True)
+
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
+            output = lejepa_forward(model, sigreg, batch, config)
+            loss = output["loss"]
+
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            if grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            if grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+
+        step_metrics = {
+            "loss": output["loss"].detach().item(),
+            "pred_loss": output["pred_loss"].detach().item(),
+            "sigreg_loss": output["sigreg_loss"].detach().item(),
+            "codebook_loss": output["codebook_loss"].detach().item(),
+            "commitment_loss": output["commitment_loss"].detach().item(),
+        }
+
+        for key, value in step_metrics.items():
+            running_totals[key] += value
+            epoch_totals[key] += value
+
+        running_batches += 1
+        epoch_batches += 1
+
+        row = metrics_row(
+            split="train",
+            epoch=epoch,
+            epoch_step=batch_idx,
+            global_step=global_step,
+            lr=optimizer.param_groups[0]["lr"],
+            metrics=step_metrics,
+        )
+        on_step_end(row, batch_idx=batch_idx)
+
+        if batch_idx % max(1, config.logging.console_every_steps) == 0:
+            averaged = average_metrics(running_totals, running_batches)
+            progress.set_postfix(
+                loss=f"{averaged['loss']:.4f}",
+                pred=f"{averaged['pred_loss']:.4f}",
+                sigreg=f"{averaged['sigreg_loss']:.4f}",
+                codebook=f"{averaged['codebook_loss']:.4f}",
+                commit=f"{averaged['commitment_loss']:.4f}",
+                lr=f"{optimizer.param_groups[0]['lr']:.2e}",
+            )
+            running_totals = empty_metrics()
+            running_batches = 0
+
+    return average_metrics(epoch_totals, epoch_batches)
+
+
+def main():
+    import stable_pretraining as spt
+    import torch
+
+    config = CONFIG
+    run_dir = create_run_dir(config)
+    save_run_config(config, run_dir)
+
+    torch.manual_seed(config.seed)
+    dataset = build_dataset(config)
+
+    generator = torch.Generator().manual_seed(config.seed)
+    train_set, val_set = spt.data.random_split(
+        dataset,
+        lengths=[config.train_split, 1 - config.train_split],
+        generator=generator,
+    )
+
+    loader_kwargs = {
+        "batch_size": config.loader.batch_size,
+        "num_workers": config.loader.num_workers,
+        "persistent_workers": config.loader.persistent_workers and config.loader.num_workers > 0,
+        "pin_memory": config.loader.pin_memory,
+    }
+    if config.loader.num_workers > 0:
+        loader_kwargs["prefetch_factor"] = config.loader.prefetch_factor
+
+    train_loader = torch.utils.data.DataLoader(
+        train_set,
+        shuffle=True,
+        drop_last=True,
+        generator=generator,
+        **loader_kwargs,
+    )
+    val_loader = torch.utils.data.DataLoader(
+        val_set,
+        shuffle=False,
+        drop_last=False,
+        **loader_kwargs,
+    )
+
+    model, sigreg = build_model(config)
+    device = resolve_device(config)
+    amp_dtype, use_grad_scaler = resolve_amp(device, config.trainer.precision)
     model = model.to(device)
     sigreg = sigreg.to(device)
 
-    optimizer_cls = getattr(torch.optim, cfg.optimizer.type)
-    optimizer_kwargs = {
-        key: OmegaConf.to_container(value, resolve=True) if OmegaConf.is_config(value) else value
-        for key, value in cfg.optimizer.items()
-        if key != "type"
-    }
-    optimizer = optimizer_cls(model.parameters(), **optimizer_kwargs)
-    scheduler = build_scheduler(optimizer, max_epochs=cfg.trainer.max_epochs)
+    optimizer = build_optimizer(model, config)
+    scheduler = build_scheduler(optimizer, max_epochs=config.trainer.max_epochs)
     scaler = torch.amp.GradScaler("cuda", enabled=use_grad_scaler)
 
-    run_id = cfg.get("subdir") or ""
-    run_dir = Path(cfg.cache_dir, run_id)
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    with open(run_dir / "config.yaml", "w", encoding="utf-8") as f:
-        OmegaConf.save(cfg, f)
-
+    metrics_jsonl = JsonlLogger(run_dir / "metrics.jsonl")
+    metrics_tsv = TsvLogger(run_dir / "metrics.tsv") if config.logging.save_tsv else None
+    plot_rows: list[dict] = []
+    pending_rows: list[dict] = []
     artifact_saver = ModelArtifactSaver(
-        dirpath=run_dir, filename=cfg.output_model_name, epoch_interval=1
+        dirpath=run_dir,
+        filename=config.output_model_name,
+        epoch_interval=1,
     )
-    metrics_logger = JsonlLogger(run_dir / "metrics.jsonl")
-    tsv_logger = TsvLogger(run_dir / "metrics.tsv") if cfg.logging.get("save_tsv", True) else None
-    history = []
 
-    max_epochs = int(cfg.trainer.max_epochs)
-    log_interval = max(1, int(cfg.logging.get("log_interval", 1)))
-    plot_interval = max(1, int(cfg.logging.get("plot_interval", 1)))
-    global_step = 0
+    def flush_pending_rows():
+        if not pending_rows:
+            return
+        for pending_row in pending_rows:
+            metrics_jsonl.log(pending_row)
+            if metrics_tsv is not None:
+                metrics_tsv.log(pending_row)
+        pending_rows.clear()
 
-    def persist_metrics(payload: dict, *, update_plot: bool = False):
-        history.append(payload)
-        metrics_logger.log(payload)
-        if tsv_logger is not None:
-            tsv_logger.log(payload)
+    def persist_row(row: dict, *, update_plot: bool = False, flush: bool = False):
+        pending_rows.append(row)
+        plot_rows.append(row)
+        if flush or len(pending_rows) >= max(1, config.logging.write_every_steps):
+            flush_pending_rows()
         if update_plot:
-            save_training_plots(history, run_dir / "training_curves.png")
+            save_training_plots(plot_rows, run_dir / "training_curves.png")
 
-    for epoch in range(1, max_epochs + 1):
-        train_metrics = train_one_epoch(
+    global_step = 0
+    for epoch in range(1, config.trainer.max_epochs + 1):
+        epoch_train_metrics = train_one_epoch(
             model=model,
             sigreg=sigreg,
             loader=train_loader,
@@ -422,47 +484,46 @@ def run(cfg):
             scaler=scaler,
             device=device,
             amp_dtype=amp_dtype,
-            cfg=cfg,
+            config=config,
             epoch=epoch,
             global_step_start=global_step,
-            on_step_metrics=lambda payload: persist_metrics(payload, update_plot=True),
+            on_step_end=lambda row, batch_idx: persist_row(
+                row,
+                update_plot=batch_idx % max(1, config.logging.plot_every_steps) == 0,
+                flush=batch_idx % max(1, config.logging.write_every_steps) == 0,
+            ),
         )
         global_step += len(train_loader)
-        val_metrics = evaluate(
+
+        val_row = evaluate(
             model=model,
             sigreg=sigreg,
             loader=val_loader,
             device=device,
             amp_dtype=amp_dtype,
-            cfg=cfg,
-        )
-        maybe_step_scheduler(scheduler)
-
-        current_lr = optimizer.param_groups[0]["lr"]
-        metrics = make_metrics_payload(
-            kind="epoch",
+            config=config,
             epoch=epoch,
-            epoch_step=len(train_loader),
             global_step=global_step,
-            lr=current_lr,
-            train_metrics=train_metrics,
-            val_metrics=val_metrics,
         )
-        persist_metrics(metrics)
-        artifact_saver.save_epoch(model=model, epoch=epoch, max_epochs=max_epochs)
-        if epoch % plot_interval == 0 or epoch == 1 or epoch == max_epochs:
-            save_training_plots(history, run_dir / "training_curves.png")
+        persist_row(val_row, update_plot=True, flush=True)
 
-        if epoch % log_interval == 0 or epoch == 1 or epoch == max_epochs:
-            print(
-                f"epoch {epoch}/{max_epochs} "
-                f"train_loss={train_metrics['loss']:.6f} "
-                f"val_loss={val_metrics['loss']:.6f} "
-                f"lr={current_lr:.6e}"
-            )
+        scheduler.step()
+        artifact_saver.save_epoch(model=model, epoch=epoch, max_epochs=config.trainer.max_epochs)
+        if epoch % max(1, config.logging.plot_every_epochs) == 0:
+            save_training_plots(plot_rows, run_dir / "training_curves.png")
 
+        print(
+            f"epoch {epoch}/{config.trainer.max_epochs} "
+            f"train_loss={epoch_train_metrics['loss']:.6f} "
+            f"val_loss={val_row['loss']:.6f} "
+            f"step={global_step}"
+        )
+
+    flush_pending_rows()
     artifact_saver.save_final(model=model)
+    save_training_plots(plot_rows, run_dir / "training_curves.png")
+    print(f"saved run to {run_dir}")
 
 
 if __name__ == "__main__":
-    run()
+    main()

@@ -49,18 +49,25 @@ Place the extracted `.h5` files under `$STABLEWM_HOME` (defaults to `~/.stable-w
 export STABLEWM_HOME=/path/to/your/storage
 ```
 
-Dataset names are specified without the `.h5` extension. For example, `config/train/data/pusht.yaml` references `pusht_expert_train`, which resolves to `$STABLEWM_HOME/pusht_expert_train.h5`.
+Dataset names are specified without the `.h5` extension. For example, the `pusht` preset maps to `pusht_expert_train`, which resolves to `$STABLEWM_HOME/pusht_expert_train.h5`.
 
 ## Training
 
-`jepa.py` contains the PyTorch implementation of LeWM. Training is configured via [Hydra](https://hydra.cc/) config files under `config/train/`.
+`jepa.py` contains the PyTorch implementation of LeWM. Training now uses a plain Python config in [config.py](/home/matteo/Documents/le-wm/config.py).
 
 To launch training:
 ```bash
-python train.py data=pusht
+python train.py
 ```
 
-Training writes checkpoints and a local `metrics.jsonl` log to `$STABLEWM_HOME/<run_id>/`.
+Edit `CONFIG` in [config.py](/home/matteo/Documents/le-wm/config.py) to change the dataset preset, batch size, epoch count, plotting cadence, and other training settings.
+
+Each run writes to `runs/<timestamp>-<dataset>/` and includes:
+- `config.json`
+- `metrics.tsv`
+- `metrics.jsonl`
+- `training_curves.png`
+- checkpoint files
 
 For baseline scripts, see the stable-worldmodel [scripts](https://github.com/galilai-group/stable-worldmodel/tree/main/scripts/train) folder.
 
