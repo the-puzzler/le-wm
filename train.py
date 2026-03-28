@@ -40,6 +40,7 @@ def build_train_config() -> dict:
             "devices": cfg.DEVICES,
             "precision": cfg.PRECISION,
             "gradient_clip_val": cfg.GRADIENT_CLIP_VAL,
+            "use_torch_compile": cfg.USE_TORCH_COMPILE,
         },
         "logging": {
             "console_every_steps": cfg.CONSOLE_EVERY_STEPS,
@@ -318,6 +319,21 @@ def build_scheduler(optimizer, max_epochs: int):
     return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs)
 
 
+def maybe_compile_model(model, config: dict):
+    import torch
+
+    if not config["trainer"].get("use_torch_compile", False):
+        return model
+    if not hasattr(torch, "compile"):
+        print("torch.compile is not available in this PyTorch build; continuing without compile.")
+        return model
+    try:
+        return torch.compile(model)
+    except Exception as exc:
+        print(f"torch.compile failed, continuing without compile: {exc}")
+        return model
+
+
 def empty_metrics() -> dict[str, float]:
     return {
         "loss": 0.0,
@@ -523,6 +539,7 @@ def main():
     )
 
     model, sigreg = build_model(config)
+    model = maybe_compile_model(model, config)
     device = resolve_device(config)
     amp_dtype, use_grad_scaler = resolve_amp(device, config["trainer"]["precision"])
     model = model.to(device)
