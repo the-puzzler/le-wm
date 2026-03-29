@@ -572,11 +572,11 @@ def main():
     )
 
     model, sigreg = build_model(config)
-    model = maybe_compile_model(model, config)
     device = resolve_device(config)
     amp_dtype, use_grad_scaler = resolve_amp(device, config["trainer"]["precision"])
     model = model.to(device)
     sigreg = sigreg.to(device)
+    model = maybe_compile_model(model, config)
 
     optimizer = build_optimizer(model, config)
     total_train_steps = config["trainer"]["max_epochs"] * len(train_loader)
