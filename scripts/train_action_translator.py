@@ -15,7 +15,6 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.utils import make_grid, save_image
 from tqdm.auto import tqdm
 
 import config as cfg
@@ -30,64 +29,51 @@ from train import (
 from utils import JsonlLogger, ModelArtifactSaver, TsvLogger
 
 
-class VisualDecoder(nn.Module):
-    def __init__(self, embed_dim: int, base_channels: int = 256):
+class ActionTranslator(nn.Module):
+    def __init__(self, num_codes: int, state_dim: int, action_dim: int, hidden_dim: int):
         super().__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(embed_dim, base_channels * 14 * 14),
-            nn.GELU(),
-        )
+        self.code_embedding = nn.Embedding(num_codes, hidden_dim)
         self.net = nn.Sequential(
-            nn.ConvTranspose2d(base_channels, 128, kernel_size=4, stride=2, padding=1),
-            nn.GroupNorm(8, 128),
+            nn.Linear(hidden_dim + state_dim, hidden_dim),
             nn.GELU(),
-            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
-            nn.GroupNorm(8, 64),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
-            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
-            nn.GroupNorm(8, 32),
-            nn.GELU(),
-            nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1),
-            nn.GroupNorm(8, 16),
-            nn.GELU(),
-            nn.Conv2d(16, 3, kernel_size=3, padding=1),
+            nn.Linear(hidden_dim, action_dim),
         )
 
-    def forward(self, z):
-        x = self.fc(z)
-        x = x.view(z.size(0), -1, 14, 14)
-        return self.net(x)
+    def forward(self, state_emb: torch.Tensor, code_indices: torch.Tensor) -> torch.Tensor:
+        code_emb = self.code_embedding(code_indices)
+        features = torch.cat([state_emb, code_emb], dim=-1)
+        return self.net(features)
 
 
-def build_decoder_config() -> dict:
+def build_translator_config() -> dict:
     return {
-        "run_name": cfg.DECODER_RUN_NAME,
+        "run_name": cfg.TRANSLATOR_RUN_NAME,
         "runs_dir": Path(cfg.RUNS_DIR),
         "cache_dir": str(cfg.CACHE_DIR),
-        "source_checkpoint": cfg.DECODER_SOURCE_CHECKPOINT,
-        "source_model_mode": cfg.DECODER_SOURCE_MODEL_MODE,
+        "source_checkpoint": cfg.TRANSLATOR_SOURCE_CHECKPOINT,
+        "source_model_mode": cfg.TRANSLATOR_SOURCE_MODEL_MODE,
         "seed": cfg.SEED,
-        "img_size": cfg.IMG_SIZE,
         "train_split": cfg.TRAIN_SPLIT,
-        "output_model_name": f"{cfg.OUTPUT_MODEL_NAME}_decoder",
-        "embed_dim": cfg.DECODER_EMBED_DIM,
-        "base_channels": cfg.DECODER_BASE_CHANNELS,
-        "max_epochs": cfg.DECODER_MAX_EPOCHS,
-        "batch_size": cfg.DECODER_BATCH_SIZE,
-        "num_workers": cfg.DECODER_NUM_WORKERS,
-        "persistent_workers": cfg.DECODER_PERSISTENT_WORKERS,
-        "prefetch_factor": cfg.DECODER_PREFETCH_FACTOR,
-        "pin_memory": cfg.DECODER_PIN_MEMORY,
-        "lr": cfg.DECODER_LEARNING_RATE,
-        "weight_decay": cfg.DECODER_WEIGHT_DECAY,
-        "gradient_clip_val": cfg.DECODER_GRADIENT_CLIP_VAL,
-        "console_every_steps": cfg.DECODER_CONSOLE_EVERY_STEPS,
-        "write_every_steps": cfg.DECODER_WRITE_EVERY_STEPS,
-        "plot_every_steps": cfg.DECODER_PLOT_EVERY_STEPS,
-        "plot_every_epochs": cfg.DECODER_PLOT_EVERY_EPOCHS,
-        "save_tsv": cfg.DECODER_SAVE_TSV,
-        "num_vis_samples": cfg.DECODER_NUM_VIS_SAMPLES,
-        "topk_fraction": cfg.DECODER_TOPK_FRACTION,
+        "output_model_name": f"{cfg.OUTPUT_MODEL_NAME}_action_translator",
+        "max_epochs": cfg.TRANSLATOR_MAX_EPOCHS,
+        "batch_size": cfg.TRANSLATOR_BATCH_SIZE,
+        "num_workers": cfg.TRANSLATOR_NUM_WORKERS,
+        "persistent_workers": cfg.TRANSLATOR_PERSISTENT_WORKERS,
+        "prefetch_factor": cfg.TRANSLATOR_PREFETCH_FACTOR,
+        "pin_memory": cfg.TRANSLATOR_PIN_MEMORY,
+        "lr": cfg.TRANSLATOR_LEARNING_RATE,
+        "weight_decay": cfg.TRANSLATOR_WEIGHT_DECAY,
+        "gradient_clip_val": cfg.TRANSLATOR_GRADIENT_CLIP_VAL,
+        "hidden_dim": cfg.TRANSLATOR_HIDDEN_DIM,
+        "console_every_steps": cfg.TRANSLATOR_CONSOLE_EVERY_STEPS,
+        "write_every_steps": cfg.TRANSLATOR_WRITE_EVERY_STEPS,
+        "plot_every_steps": cfg.TRANSLATOR_PLOT_EVERY_STEPS,
+        "plot_every_epochs": cfg.TRANSLATOR_PLOT_EVERY_EPOCHS,
+        "save_tsv": cfg.TRANSLATOR_SAVE_TSV,
+        "num_vis_samples": cfg.TRANSLATOR_NUM_VIS_SAMPLES,
+        "mse_weight": cfg.TRANSLATOR_MSE_WEIGHT,
     }
 
 
@@ -113,7 +99,7 @@ def find_latest_checkpoint() -> Path:
         [
             path
             for path in runs_dir.glob("*/*_object.ckpt")
-            if "_decoder" not in path.name
+            if "_decoder" not in path.name and "_translator" not in path.name
         ],
         key=lambda path: path.stat().st_mtime,
     )
@@ -122,25 +108,26 @@ def find_latest_checkpoint() -> Path:
     return candidates[-1]
 
 
-def build_data_loaders(train_config: dict, decoder_config: dict):
+def build_data_loaders(train_config: dict, translator_config: dict):
     import stable_pretraining as spt
 
     dataset = build_dataset(train_config)
-    generator = torch.Generator().manual_seed(decoder_config["seed"])
+    generator = torch.Generator().manual_seed(translator_config["seed"])
     train_set, val_set = spt.data.random_split(
         dataset,
-        lengths=[decoder_config["train_split"], 1 - decoder_config["train_split"]],
+        lengths=[translator_config["train_split"], 1 - translator_config["train_split"]],
         generator=generator,
     )
 
     loader_kwargs = {
-        "batch_size": decoder_config["batch_size"],
-        "num_workers": decoder_config["num_workers"],
-        "persistent_workers": decoder_config["persistent_workers"] and decoder_config["num_workers"] > 0,
-        "pin_memory": decoder_config["pin_memory"],
+        "batch_size": translator_config["batch_size"],
+        "num_workers": translator_config["num_workers"],
+        "persistent_workers": translator_config["persistent_workers"]
+        and translator_config["num_workers"] > 0,
+        "pin_memory": translator_config["pin_memory"],
     }
-    if decoder_config["num_workers"] > 0:
-        loader_kwargs["prefetch_factor"] = decoder_config["prefetch_factor"]
+    if translator_config["num_workers"] > 0:
+        loader_kwargs["prefetch_factor"] = translator_config["prefetch_factor"]
 
     train_loader = torch.utils.data.DataLoader(
         train_set,
@@ -167,7 +154,7 @@ def set_source_model_mode(model, mode: str):
     elif mode == "eval":
         model.eval()
     else:
-        raise ValueError(f"Unsupported DECODER_SOURCE_MODEL_MODE: {mode}")
+        raise ValueError(f"Unsupported TRANSLATOR_SOURCE_MODEL_MODE: {mode}")
 
 
 def freeze_source_model(model):
@@ -175,36 +162,30 @@ def freeze_source_model(model):
         param.requires_grad_(False)
 
 
-def denormalize_pixels(x: torch.Tensor) -> torch.Tensor:
-    mean = torch.tensor([0.485, 0.456, 0.406], device=x.device).view(1, 3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225], device=x.device).view(1, 3, 1, 1)
-    return (x * std + mean).clamp(0.0, 1.0)
+def extract_translator_targets(source_model, batch: dict, train_config: dict):
+    batch = dict(batch)
+    batch["action"] = torch.nan_to_num(batch["action"], 0.0)
+    ctx_len = train_config["wm"]["history_size"]
+    n_preds = train_config["wm"]["num_preds"]
 
-
-def extract_latents(source_model, batch: dict, train_config: dict):
     output = source_model.encode(batch)
     emb = output["emb"]
-    pred_emb = None
+    code_features = source_model.infer_action_codes(emb[:, : ctx_len + n_preds])
+    vq_output = source_model.quantize_action_codes(code_features[:, :ctx_len])
 
-    if train_config["wm"]["use_learned_actions"]:
-        ctx_len = train_config["wm"]["history_size"]
-        n_preds = train_config["wm"]["num_preds"]
-        code_features = source_model.infer_action_codes(emb[:, : ctx_len + n_preds])
-        vq_output = source_model.quantize_action_codes(code_features[:, :ctx_len])
-        ctx_act = vq_output["quantized"]
-        pred_emb = source_model.predict(emb[:, :ctx_len], ctx_act)
-
-    return emb, pred_emb
+    state_emb = emb[:, :ctx_len].reshape(-1, emb.size(-1))
+    code_indices = vq_output["indices"].reshape(-1)
+    target_actions = batch["action"][:, :ctx_len].reshape(-1, batch["action"].size(-1))
+    return state_emb, code_indices, target_actions
 
 
-def compute_decoder_losses(recon: torch.Tensor, target: torch.Tensor, topk_fraction: float) -> dict[str, torch.Tensor]:
-    per_pixel_mse = (recon - target).pow(2).reshape(recon.size(0), -1)
-    k = max(1, int(per_pixel_mse.size(1) * topk_fraction))
-    topk_mse_loss = per_pixel_mse.topk(k=k, dim=1).values.mean()
-    mse_loss = per_pixel_mse.mean()
+def compute_losses(pred_action: torch.Tensor, target_action: torch.Tensor, mse_weight: float) -> dict[str, torch.Tensor]:
+    l1_loss = F.l1_loss(pred_action, target_action)
+    mse_loss = F.mse_loss(pred_action, target_action)
+    loss = l1_loss + mse_weight * mse_loss
     return {
-        "loss": topk_mse_loss,
-        "topk_mse_loss": topk_mse_loss,
+        "loss": loss,
+        "l1_loss": l1_loss,
         "mse_loss": mse_loss,
     }
 
@@ -217,7 +198,7 @@ def metrics_row(*, split: str, epoch: int, epoch_step: int, global_step: int, lr
         "global_step": global_step,
         "lr": lr,
         "loss": metrics["loss"],
-        "topk_mse_loss": metrics["topk_mse_loss"],
+        "l1_loss": metrics["l1_loss"],
         "mse_loss": metrics["mse_loss"],
     }
 
@@ -226,53 +207,52 @@ def average_metrics(totals: dict[str, float], count: int) -> dict[str, float]:
     return {key: value / max(1, count) for key, value in totals.items()}
 
 
-def save_decoder_plots(history: list[dict], output_path: Path):
-    save_decoder_plots_with_visuals(history, output_path, visualization_path=None)
-
-
-def render_reconstruction_grid(
+def save_action_visualization(
     source_model,
-    decoder,
+    translator,
     loader,
     device,
     amp_dtype,
     train_config: dict,
-    decoder_config: dict,
+    translator_config: dict,
+    output_path: Path,
 ):
     batch = next(iter(loader))
     batch = move_batch_to_device(batch, device)
-    num_samples = min(decoder_config["num_vis_samples"], batch["pixels"].size(0))
-    batch = {key: value[:num_samples] if torch.is_tensor(value) else value for key, value in batch.items()}
 
     with torch.no_grad():
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
-            emb, pred_emb = extract_latents(source_model, batch, train_config)
-            ctx_len = train_config["wm"]["history_size"]
-            n_preds = train_config["wm"]["num_preds"]
-            target_pixels = batch["pixels"][:, n_preds:]
-            recon_target = decoder(emb[:, n_preds:].reshape(-1, emb.size(-1))).view_as(target_pixels)
-            recon_pred = None
-            if pred_emb is not None:
-                recon_pred = decoder(pred_emb.reshape(-1, pred_emb.size(-1))).view_as(target_pixels)
+            state_emb, code_indices, target_actions = extract_translator_targets(
+                source_model,
+                batch,
+                train_config,
+            )
+            pred_actions = translator(state_emb, code_indices)
 
-    rows = []
-    labels = []
+    num_samples = min(translator_config["num_vis_samples"], target_actions.size(0))
+    target_actions = target_actions[:num_samples].detach().cpu()
+    pred_actions = pred_actions[:num_samples].detach().cpu()
+    code_indices = code_indices[:num_samples].detach().cpu()
+
+    fig, axes = plt.subplots(num_samples, 1, figsize=(12, 2.4 * num_samples), squeeze=False)
     for sample_idx in range(num_samples):
-        rows.append(denormalize_pixels(target_pixels[sample_idx]))
-        labels.append("target")
-        rows.append(denormalize_pixels(recon_target[sample_idx]))
-        labels.append("recon(real z)")
-        if recon_pred is not None:
-            rows.append(denormalize_pixels(recon_pred[sample_idx]))
-            labels.append("recon(pred z)")
+        ax = axes[sample_idx, 0]
+        dims = list(range(target_actions.size(-1)))
+        ax.plot(dims, target_actions[sample_idx].tolist(), marker="o", label="target")
+        ax.plot(dims, pred_actions[sample_idx].tolist(), marker="x", label="pred")
+        ax.set_title(f"Sample {sample_idx + 1} | code {int(code_indices[sample_idx])}")
+        ax.set_xlabel("Action Dimension")
+        ax.set_ylabel("Value")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
 
-    flat = torch.cat(rows, dim=0)
-    nrow = target_pixels.size(1)
-    grid = make_grid(flat, nrow=nrow, padding=2)
-    return grid, labels, nrow
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
 
 
-def save_decoder_plots_with_visuals(history: list[dict], output_path: Path, visualization_path: Path | None):
+def save_translator_plots_with_visuals(history: list[dict], output_path: Path, visualization_path: Path | None):
     if not history:
         return
 
@@ -289,7 +269,7 @@ def save_decoder_plots_with_visuals(history: list[dict], output_path: Path, visu
         image_ax = None
     else:
         fig = plt.figure(figsize=(14, 10))
-        gs = fig.add_gridspec(3, 2, height_ratios=[1, 1, 1.3])
+        gs = fig.add_gridspec(3, 2, height_ratios=[1, 1, 1.35])
         axes = [
             fig.add_subplot(gs[0, 0]),
             fig.add_subplot(gs[0, 1]),
@@ -300,7 +280,7 @@ def save_decoder_plots_with_visuals(history: list[dict], output_path: Path, visu
 
     plots = [
         ("Total Loss", "loss"),
-        ("Top-k MSE Loss", "topk_mse_loss"),
+        ("L1 Loss", "l1_loss"),
         ("MSE Loss", "mse_loss"),
         ("Learning Rate", "lr"),
     ]
@@ -320,7 +300,7 @@ def save_decoder_plots_with_visuals(history: list[dict], output_path: Path, visu
         image = plt.imread(visualization_path)
         image_ax.imshow(image)
         image_ax.axis("off")
-        image_ax.set_title("Reconstruction Preview")
+        image_ax.set_title("Action Translation Preview")
 
     fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -328,32 +308,10 @@ def save_decoder_plots_with_visuals(history: list[dict], output_path: Path, visu
     plt.close(fig)
 
 
-def save_reconstruction_visualization(
-    source_model,
-    decoder,
-    loader,
-    device,
-    amp_dtype,
-    train_config: dict,
-    decoder_config: dict,
-    output_path: Path,
-):
-    grid, _, _ = render_reconstruction_grid(
-        source_model,
-        decoder,
-        loader,
-        device,
-        amp_dtype,
-        train_config,
-        decoder_config,
-    )
-    save_image(grid, output_path)
-
-
 def train_one_epoch(
     *,
     source_model,
-    decoder,
+    translator,
     loader,
     optimizer,
     scheduler,
@@ -361,44 +319,45 @@ def train_one_epoch(
     device,
     amp_dtype,
     train_config: dict,
-    decoder_config: dict,
+    translator_config: dict,
     epoch: int,
     global_step_start: int,
     on_step_end,
 ):
-    decoder.train()
-    totals = {"loss": 0.0, "topk_mse_loss": 0.0, "mse_loss": 0.0}
-    running = {"loss": 0.0, "topk_mse_loss": 0.0, "mse_loss": 0.0}
+    translator.train()
+    totals = {"loss": 0.0, "l1_loss": 0.0, "mse_loss": 0.0}
+    running = {"loss": 0.0, "l1_loss": 0.0, "mse_loss": 0.0}
     total_batches = 0
     running_batches = 0
 
-    progress = tqdm(loader, desc=f"decoder train {epoch}", leave=False)
+    progress = tqdm(loader, desc=f"translator train {epoch}", leave=False)
     for batch_idx, batch in enumerate(progress, start=1):
         global_step = global_step_start + batch_idx
         batch = move_batch_to_device(batch, device)
 
         with torch.no_grad():
-            emb, _ = extract_latents(source_model, batch, train_config)
-
-        latent = emb.reshape(-1, emb.size(-1))
-        target = batch["pixels"].reshape(-1, *batch["pixels"].shape[2:])
+            state_emb, code_indices, target_actions = extract_translator_targets(
+                source_model,
+                batch,
+                train_config,
+            )
 
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
-            recon = decoder(latent)
-            losses = compute_decoder_losses(recon, target, decoder_config["topk_fraction"])
+            pred_actions = translator(state_emb, code_indices)
+            losses = compute_losses(pred_actions, target_actions, translator_config["mse_weight"])
 
         if scaler is not None:
             scaler.scale(losses["loss"]).backward()
             scaler.unscale_(optimizer)
-            if decoder_config["gradient_clip_val"] is not None:
-                torch.nn.utils.clip_grad_norm_(decoder.parameters(), decoder_config["gradient_clip_val"])
+            if translator_config["gradient_clip_val"] is not None:
+                torch.nn.utils.clip_grad_norm_(translator.parameters(), translator_config["gradient_clip_val"])
             scaler.step(optimizer)
             scaler.update()
         else:
             losses["loss"].backward()
-            if decoder_config["gradient_clip_val"] is not None:
-                torch.nn.utils.clip_grad_norm_(decoder.parameters(), decoder_config["gradient_clip_val"])
+            if translator_config["gradient_clip_val"] is not None:
+                torch.nn.utils.clip_grad_norm_(translator.parameters(), translator_config["gradient_clip_val"])
             optimizer.step()
         if scheduler is not None:
             scheduler.step()
@@ -422,44 +381,46 @@ def train_one_epoch(
             batch_idx=batch_idx,
         )
 
-        if batch_idx % max(1, decoder_config["console_every_steps"]) == 0:
+        if batch_idx % max(1, translator_config["console_every_steps"]) == 0:
             progress.set_postfix(
                 loss=f"{running['loss'] / running_batches:.4f}",
-                topk=f"{running['topk_mse_loss'] / running_batches:.4f}",
+                l1=f"{running['l1_loss'] / running_batches:.4f}",
                 mse=f"{running['mse_loss'] / running_batches:.4f}",
                 lr=f"{optimizer.param_groups[0]['lr']:.2e}",
             )
-            running = {"loss": 0.0, "topk_mse_loss": 0.0, "mse_loss": 0.0}
+            running = {"loss": 0.0, "l1_loss": 0.0, "mse_loss": 0.0}
             running_batches = 0
 
     return average_metrics(totals, total_batches)
 
 
-def evaluate_decoder(
+def evaluate_translator(
     *,
     source_model,
-    decoder,
+    translator,
     loader,
     device,
     amp_dtype,
     train_config: dict,
-    decoder_config: dict,
+    translator_config: dict,
     epoch: int,
     global_step: int,
 ):
-    decoder.eval()
-    totals = {"loss": 0.0, "topk_mse_loss": 0.0, "mse_loss": 0.0}
+    translator.eval()
+    totals = {"loss": 0.0, "l1_loss": 0.0, "mse_loss": 0.0}
     total_batches = 0
 
     with torch.no_grad():
-        for batch in tqdm(loader, desc=f"decoder val {epoch}", leave=False):
+        for batch in tqdm(loader, desc=f"translator val {epoch}", leave=False):
             batch = move_batch_to_device(batch, device)
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
-                emb, _ = extract_latents(source_model, batch, train_config)
-                latent = emb.reshape(-1, emb.size(-1))
-                target = batch["pixels"].reshape(-1, *batch["pixels"].shape[2:])
-                recon = decoder(latent)
-                losses = compute_decoder_losses(recon, target, decoder_config["topk_fraction"])
+                state_emb, code_indices, target_actions = extract_translator_targets(
+                    source_model,
+                    batch,
+                    train_config,
+                )
+                pred_actions = translator(state_emb, code_indices)
+                losses = compute_losses(pred_actions, target_actions, translator_config["mse_weight"])
 
             for key, value in losses.items():
                 totals[key] += value.detach().item()
@@ -479,11 +440,18 @@ def main():
     torch.manual_seed(cfg.SEED)
 
     train_config = build_train_config()
-    decoder_config = build_decoder_config()
-    checkpoint_path = Path(decoder_config["source_checkpoint"]) if decoder_config["source_checkpoint"] else find_latest_checkpoint()
+    if not train_config["wm"]["use_learned_actions"]:
+        raise ValueError("Action translator is only needed when USE_LEARNED_ACTIONS = True.")
 
-    run_dir = create_run_dir(decoder_config)
-    save_run_config({**decoder_config, "source_checkpoint": str(checkpoint_path)}, run_dir)
+    translator_config = build_translator_config()
+    checkpoint_path = (
+        Path(translator_config["source_checkpoint"])
+        if translator_config["source_checkpoint"]
+        else find_latest_checkpoint()
+    )
+
+    run_dir = create_run_dir(translator_config)
+    save_run_config({**translator_config, "source_checkpoint": str(checkpoint_path)}, run_dir)
 
     device = resolve_device(train_config)
     amp_dtype, use_grad_scaler = resolve_amp(device, train_config["trainer"]["precision"])
@@ -491,34 +459,37 @@ def main():
     source_model = torch.load(checkpoint_path, map_location=device, weights_only=False)
     source_model = source_model.to(device)
     freeze_source_model(source_model)
-    set_source_model_mode(source_model, decoder_config["source_model_mode"])
+    set_source_model_mode(source_model, translator_config["source_model_mode"])
 
-    decoder = VisualDecoder(
-        embed_dim=decoder_config["embed_dim"],
-        base_channels=decoder_config["base_channels"],
+    action_dim = train_config["dataset"]["frameskip"] * train_config["wm"]["action_dim"]
+    translator = ActionTranslator(
+        num_codes=train_config["codebook"]["num_codes"],
+        state_dim=train_config["wm"]["embed_dim"],
+        action_dim=action_dim,
+        hidden_dim=translator_config["hidden_dim"],
     ).to(device)
 
-    train_loader, val_loader = build_data_loaders(train_config, decoder_config)
+    train_loader, val_loader = build_data_loaders(train_config, translator_config)
 
     optimizer = torch.optim.AdamW(
-        decoder.parameters(),
-        lr=decoder_config["lr"],
-        weight_decay=decoder_config["weight_decay"],
+        translator.parameters(),
+        lr=translator_config["lr"],
+        weight_decay=translator_config["weight_decay"],
     )
-    total_train_steps = decoder_config["max_epochs"] * len(train_loader)
+    total_train_steps = translator_config["max_epochs"] * len(train_loader)
     scheduler = build_scheduler(optimizer, total_train_steps=total_train_steps)
     scaler = torch.amp.GradScaler("cuda", enabled=use_grad_scaler)
 
     metrics_jsonl = JsonlLogger(run_dir / "metrics.jsonl")
-    metrics_tsv = TsvLogger(run_dir / "metrics.tsv") if decoder_config["save_tsv"] else None
+    metrics_tsv = TsvLogger(run_dir / "metrics.tsv") if translator_config["save_tsv"] else None
     plot_rows: list[dict] = []
     pending_rows: list[dict] = []
     artifact_saver = ModelArtifactSaver(
         dirpath=run_dir,
-        filename=decoder_config["output_model_name"],
+        filename=translator_config["output_model_name"],
         epoch_interval=1,
     )
-    latest_vis_path = run_dir / "reconstructions_latest.png"
+    latest_vis_path = run_dir / "action_translation_latest.png"
 
     def flush_pending_rows():
         if not pending_rows:
@@ -532,30 +503,30 @@ def main():
     def persist_row(row: dict, *, update_plot: bool = False, flush: bool = False):
         pending_rows.append(row)
         plot_rows.append(row)
-        if flush or len(pending_rows) >= max(1, decoder_config["write_every_steps"]):
+        if flush or len(pending_rows) >= max(1, translator_config["write_every_steps"]):
             flush_pending_rows()
         if update_plot:
-            save_reconstruction_visualization(
+            save_action_visualization(
                 source_model,
-                decoder,
+                translator,
                 val_loader,
                 device,
                 amp_dtype,
                 train_config,
-                decoder_config,
+                translator_config,
                 latest_vis_path,
             )
-            save_decoder_plots_with_visuals(
+            save_translator_plots_with_visuals(
                 plot_rows,
                 run_dir / "training_curves.png",
                 latest_vis_path,
             )
 
     global_step = 0
-    for epoch in range(1, decoder_config["max_epochs"] + 1):
+    for epoch in range(1, translator_config["max_epochs"] + 1):
         epoch_train_metrics = train_one_epoch(
             source_model=source_model,
-            decoder=decoder,
+            translator=translator,
             loader=train_loader,
             optimizer=optimizer,
             scheduler=scheduler,
@@ -563,73 +534,77 @@ def main():
             device=device,
             amp_dtype=amp_dtype,
             train_config=train_config,
-            decoder_config=decoder_config,
+            translator_config=translator_config,
             epoch=epoch,
             global_step_start=global_step,
             on_step_end=lambda row, batch_idx: persist_row(
                 row,
-                update_plot=batch_idx % max(1, decoder_config["plot_every_steps"]) == 0,
-                flush=batch_idx % max(1, decoder_config["write_every_steps"]) == 0,
+                update_plot=batch_idx % max(1, translator_config["plot_every_steps"]) == 0,
+                flush=batch_idx % max(1, translator_config["write_every_steps"]) == 0,
             ),
         )
         global_step += len(train_loader)
 
-        val_row = evaluate_decoder(
+        val_row = evaluate_translator(
             source_model=source_model,
-            decoder=decoder,
+            translator=translator,
             loader=val_loader,
             device=device,
             amp_dtype=amp_dtype,
             train_config=train_config,
-            decoder_config=decoder_config,
+            translator_config=translator_config,
             epoch=epoch,
             global_step=global_step,
         )
         persist_row(val_row, update_plot=True, flush=True)
 
-        artifact_saver.save_epoch(decoder, epoch=epoch, max_epochs=decoder_config["max_epochs"])
-        if epoch % max(1, decoder_config["plot_every_epochs"]) == 0:
-            save_reconstruction_visualization(
+        artifact_saver.save_epoch(
+            translator,
+            epoch=epoch,
+            max_epochs=translator_config["max_epochs"],
+        )
+        if epoch % max(1, translator_config["plot_every_epochs"]) == 0:
+            save_action_visualization(
                 source_model,
-                decoder,
+                translator,
                 val_loader,
                 device,
                 amp_dtype,
                 train_config,
-                decoder_config,
-                run_dir / f"reconstructions_epoch_{epoch}.png",
+                translator_config,
+                run_dir / f"action_translation_epoch_{epoch}.png",
             )
-            save_decoder_plots_with_visuals(
+            save_translator_plots_with_visuals(
                 plot_rows,
                 run_dir / "training_curves.png",
                 latest_vis_path,
             )
 
         print(
-            f"decoder epoch {epoch}/{decoder_config['max_epochs']} "
+            f"translator epoch {epoch}/{translator_config['max_epochs']} "
             f"train_loss={epoch_train_metrics['loss']:.6f} "
             f"val_loss={val_row['loss']:.6f} "
             f"step={global_step}"
         )
 
     flush_pending_rows()
-    artifact_saver.save_final(decoder)
-    save_reconstruction_visualization(
+    artifact_saver.save_final(translator)
+    save_action_visualization(
         source_model,
-        decoder,
+        translator,
         val_loader,
         device,
         amp_dtype,
         train_config,
-        decoder_config,
+        translator_config,
         latest_vis_path,
     )
-    save_decoder_plots_with_visuals(
+    save_translator_plots_with_visuals(
         plot_rows,
         run_dir / "training_curves.png",
         latest_vis_path,
     )
-    print(f"saved decoder run to {run_dir}")
+    print(f"saved action translator run to {run_dir}")
 
 
 if __name__ == "__main__":
