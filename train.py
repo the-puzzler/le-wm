@@ -45,6 +45,8 @@ def build_train_config() -> dict:
         },
         "logging": {
             "console_every_steps": cfg.CONSOLE_EVERY_STEPS,
+            "print_timing": cfg.PRINT_TIMING,
+            "tqdm_every_steps": cfg.TQDM_EVERY_STEPS,
             "write_every_steps": cfg.WRITE_EVERY_STEPS,
             "plot_every_steps": cfg.PLOT_EVERY_STEPS,
             "plot_every_epochs": cfg.PLOT_EVERY_EPOCHS,
@@ -534,7 +536,7 @@ def train_one_epoch(
         on_step_end(row, batch_idx=batch_idx)
         timing_totals["logging_s"] += time.perf_counter() - logging_start
 
-        if batch_idx % max(1, config["logging"]["console_every_steps"]) == 0:
+        if batch_idx % max(1, config["logging"]["tqdm_every_steps"]) == 0:
             averaged = average_metrics(running_totals, running_batches)
             progress.set_postfix(
                 loss=f"{averaged['loss']:.4f}",
@@ -544,6 +546,11 @@ def train_one_epoch(
                 commit=f"{averaged['commitment_loss']:.4f}",
                 lr=f"{optimizer.param_groups[0]['lr']:.2e}",
             )
+        if (
+            config["logging"]["print_timing"]
+            and batch_idx % max(1, config["logging"]["console_every_steps"]) == 0
+        ):
+            averaged = average_metrics(running_totals, running_batches)
             print(
                 f"[timing] epoch={epoch} step={global_step} "
                 f"data_wait={timing_totals['data_wait_s']/running_batches:.4f}s "
