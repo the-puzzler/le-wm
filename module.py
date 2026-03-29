@@ -269,6 +269,35 @@ class Embedder(nn.Module):
         return x
 
 
+class VisualDecoder(nn.Module):
+    def __init__(self, embed_dim: int, base_channels: int = 256):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(embed_dim, base_channels * 14 * 14),
+            nn.GELU(),
+        )
+        self.net = nn.Sequential(
+            nn.ConvTranspose2d(base_channels, 128, kernel_size=4, stride=2, padding=1),
+            nn.GroupNorm(8, 128),
+            nn.GELU(),
+            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
+            nn.GroupNorm(8, 64),
+            nn.GELU(),
+            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
+            nn.GroupNorm(8, 32),
+            nn.GELU(),
+            nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1),
+            nn.GroupNorm(8, 16),
+            nn.GELU(),
+            nn.Conv2d(16, 3, kernel_size=3, padding=1),
+        )
+
+    def forward(self, z):
+        x = self.fc(z)
+        x = x.view(z.size(0), -1, 14, 14)
+        return self.net(x)
+
+
 class MLP(nn.Module):
     """Simple MLP with optional normalization and activation"""
 

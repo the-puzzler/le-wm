@@ -79,6 +79,9 @@ def summarize_codebook(source_model, loader, device, train_config: dict):
     sum_sq_actions = torch.zeros(num_codes, action_dim)
     sum_dirs = torch.zeros(num_codes, 2)
     sum_dir_norm = torch.zeros(num_codes)
+    octant_counts = torch.zeros(num_codes, 8, dtype=torch.long)
+    sum_unit_dirs = torch.zeros(num_codes, 2)
+    sum_nonzero_dirs = torch.zeros(num_codes, dtype=torch.long)
 
     with torch.no_grad():
         for batch in tqdm(loader, desc="analyze codes", leave=False):
@@ -95,6 +98,11 @@ def summarize_codebook(source_model, loader, device, train_config: dict):
             actions = batch["action"][:, :ctx_len].reshape(-1, action_dim).detach().cpu()
             dirs = actions.view(actions.size(0), -1, 2).mean(dim=1)
             dir_norms = dirs.norm(dim=1)
+            unit_dirs = torch.zeros_like(dirs)
+            nonzero_mask = dir_norms > 1e-6
+            unit_dirs[nonzero_mask] = dirs[nonzero_mask] / dir_norms[nonzero_mask].unsqueeze(-1)
+            angles = torch.rad2deg(torch.atan2(dirs[:, 1], dirs[:, 0]))
+            octant_indices = (((angles + 22.5) % 360) // 45).to(torch.long)
 
             for code in range(num_codes):
                 mask = code_indices == code
@@ -103,15 +111,32 @@ def summarize_codebook(source_model, loader, device, train_config: dict):
                 code_actions = actions[mask]
                 code_dirs = dirs[mask]
                 code_dir_norms = dir_norms[mask]
+                code_unit_dirs = unit_dirs[mask]
+                code_nonzero = nonzero_mask[mask]
+                code_octants = octant_indices[mask]
 
                 counts[code] += int(mask.sum())
                 sum_actions[code] += code_actions.sum(dim=0)
                 sum_sq_actions[code] += code_actions.pow(2).sum(dim=0)
                 sum_dirs[code] += code_dirs.sum(dim=0)
                 sum_dir_norm[code] += code_dir_norms.sum()
+                if code_nonzero.any():
+                    sum_unit_dirs[code] += code_unit_dirs[code_nonzero].sum(dim=0)
+                    sum_nonzero_dirs[code] += int(code_nonzero.sum())
+                octant_counts[code] += torch.bincount(code_octants, minlength=8)
 
     summaries = []
     total = int(counts.sum().item())
+    octants = [
+        "right",
+        "up-right",
+        "up",
+        "up-left",
+        "left",
+        "down-left",
+        "down",
+        "down-right",
+    ]
     for code in range(num_codes):
         count = int(counts[code].item())
         if count == 0:
@@ -123,8 +148,12 @@ def summarize_codebook(source_model, loader, device, train_config: dict):
                     "mean_action": None,
                     "std_action": None,
                     "mean_direction": None,
+                    "mean_unit_direction": None,
                     "mean_direction_norm": None,
                     "octant": None,
+                    "dominant_octant": None,
+                    "dominant_octant_fraction": None,
+                    "octant_histogram": None,
                 }
             )
             continue
@@ -134,20 +163,21 @@ def summarize_codebook(source_model, loader, device, train_config: dict):
         std_action = (mean_sq - mean_action.pow(2)).clamp_min(0.0).sqrt()
         mean_direction = sum_dirs[code] / count
         mean_direction_norm = float(sum_dir_norm[code].item() / count)
+        nonzero_count = int(sum_nonzero_dirs[code].item())
+        mean_unit_direction = None
+        if nonzero_count > 0:
+            mean_unit_direction = (sum_unit_dirs[code] / nonzero_count).tolist()
 
         angle = math.degrees(math.atan2(float(mean_direction[1]), float(mean_direction[0])))
-        octants = [
-            "right",
-            "up-right",
-            "up",
-            "up-left",
-            "left",
-            "down-left",
-            "down",
-            "down-right",
-        ]
         octant_idx = int(((angle + 22.5) % 360) // 45)
         octant = octants[octant_idx]
+        dominant_octant_idx = int(octant_counts[code].argmax().item())
+        dominant_octant_count = int(octant_counts[code, dominant_octant_idx].item())
+        dominant_octant = octants[dominant_octant_idx]
+        octant_histogram = {
+            octants[i]: int(octant_counts[code, i].item())
+            for i in range(len(octants))
+        }
 
         summaries.append(
             {
@@ -157,8 +187,12 @@ def summarize_codebook(source_model, loader, device, train_config: dict):
                 "mean_action": mean_action.tolist(),
                 "std_action": std_action.tolist(),
                 "mean_direction": mean_direction.tolist(),
+                "mean_unit_direction": mean_unit_direction,
                 "mean_direction_norm": mean_direction_norm,
                 "octant": octant,
+                "dominant_octant": dominant_octant,
+                "dominant_octant_fraction": dominant_octant_count / count,
+                "octant_histogram": octant_histogram,
             }
         )
 
