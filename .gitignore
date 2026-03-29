@@ -4,3 +4,4 @@ outputs
 *.h5
 *.zst
 runs/
+data

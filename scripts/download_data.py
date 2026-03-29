@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-import sys
+import tarfile
 import urllib.request
 from pathlib import Path
 
@@ -9,29 +9,23 @@ import zstandard as zstd
 from tqdm.auto import tqdm
 
 
-PUSHT_URL = (
-    "https://huggingface.co/datasets/quentinll/lewm-pusht/resolve/main/"
-    "pusht_expert_train.h5.zst"
+MARIO_URL = (
+    "https://huggingface.co/datasets/FeiyanZhou/mario_data/resolve/main/"
+    "mariodata.tar.gz"
 )
-PUSHT_ARCHIVE = "pusht_expert_train.h5.zst"
-PUSHT_OUTPUT = "pusht_expert_train.h5"
+MARIO_ARCHIVE = "mariodata.tar.gz"
+MARIO_OUTPUT_DIR = "mariodata"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Download LeWM datasets into a repo-local stable-worldmodel cache."
-    )
-    parser.add_argument(
-        "--dataset",
-        default="pusht",
-        choices=["pusht"],
-        help="Dataset to download. Only PushT is defined in proj.md.",
+        description="Download the Mario dataset into the repo-local cache."
     )
     parser.add_argument(
         "--output-dir",
         default=Path(__file__).resolve().parents[1] / "data" / "stablewm",
         type=Path,
-        help="Directory where the extracted .h5 file will be written.",
+        help="Directory where the extracted dataset will be written.",
     )
     parser.add_argument(
         "--force",
@@ -84,23 +78,27 @@ def decompress_zst(archive_path: Path, output_path: Path, force: bool) -> None:
                 dst.write(chunk)
                 progress.update(len(chunk))
 
+def extract_tar_gz(archive_path: Path, output_dir: Path, force: bool) -> None:
+    if output_dir.exists() and any(output_dir.iterdir()) and not force:
+        print(f"Dataset already exists: {output_dir}")
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(archive_path, "r:gz") as tar:
+        tar.extractall(path=output_dir.parent)
+
 
 def main() -> int:
     args = parse_args()
-    if args.dataset != "pusht":
-        print(f"Unsupported dataset: {args.dataset}", file=sys.stderr)
-        return 1
-
     output_dir = args.output_dir.resolve()
-    archive_path = output_dir / PUSHT_ARCHIVE
-    dataset_path = output_dir / PUSHT_OUTPUT
+    archive_path = output_dir / MARIO_ARCHIVE
+    dataset_path = output_dir / MARIO_OUTPUT_DIR
 
-    download(PUSHT_URL, archive_path, force=args.force)
-    decompress_zst(archive_path, dataset_path, force=args.force)
+    download(MARIO_URL, archive_path, force=args.force)
+    extract_tar_gz(archive_path, dataset_path, force=args.force)
 
     print(f"Dataset ready at {dataset_path}")
-    print("Training can now read it with:")
-    print("uv run python train.py data=pusht")
+
     return 0
 
 

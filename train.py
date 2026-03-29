@@ -19,6 +19,7 @@ def build_train_config() -> dict:
     return {
         "dataset_preset": cfg.TRAIN_DATASET,
         "dataset": {
+            "format": cfg.DATASET_FORMAT,
             "name": cfg.DATASET_NAME,
             "frameskip": cfg.DATASET_FRAMESKIP,
             "keys_to_load": list(cfg.DATASET_KEYS_TO_LOAD),
@@ -65,7 +66,7 @@ def build_train_config() -> dict:
             "history_size": cfg.HISTORY_SIZE,
             "num_preds": cfg.NUM_PREDS,
             "embed_dim": cfg.EMBED_DIM,
-            "action_dim": cfg.ACTION_DIM,
+            "action_dim": getattr(cfg, "ACTION_DIM", None),
             "use_learned_actions": cfg.USE_LEARNED_ACTIONS,
         },
         "codebook": {
@@ -125,7 +126,10 @@ def lejepa_forward(model, sigreg, batch, config: dict):
     sigreg_weight = config["loss"]["sigreg"]["weight"]
 
     batch = dict(batch)
-    batch["action"] = torch.nan_to_num(batch["action"], 0.0)
+    if "action" in batch:
+        batch["action"] = torch.nan_to_num(batch["action"], 0.0)
+    elif not config["wm"]["use_learned_actions"]:
+        raise ValueError("Batch is missing 'action', but USE_LEARNED_ACTIONS is False.")
 
     output = model.encode(batch)
     emb = output["emb"]
@@ -202,8 +206,22 @@ def move_batch_to_device(batch, device):
 def build_dataset(config: dict):
     import stable_pretraining as spt
     import stable_worldmodel as swm
+    from video_dataset import MarioFrameSequenceDataset
 
     dataset_cfg = config["dataset"]
+    if dataset_cfg["format"] == "mario_frames":
+        dataset_root = Path(config["cache_dir"]) / dataset_cfg["name"]
+        if not dataset_root.exists():
+            raise FileNotFoundError(
+                f"Mario dataset directory not found: {dataset_root}\n"
+                f"Download and extract mario_data into that directory or change DATASET_NAME/CACHE_DIR in config.py."
+            )
+        return MarioFrameSequenceDataset(
+            root=dataset_root,
+            num_steps=config["wm"]["history_size"] + config["wm"]["num_preds"],
+            img_size=config["img_size"],
+        )
+
     cache_dir = config["cache_dir"] or str(swm.data.utils.get_cache_dir())
     dataset_path = Path(cache_dir) / f"{dataset_cfg['name']}.h5"
     if not dataset_path.exists():
@@ -251,7 +269,12 @@ def build_model(config: dict):
     )
     hidden_dim = encoder.config.hidden_size
     embed_dim = config["wm"]["embed_dim"] or hidden_dim
-    effective_act_dim = config["dataset"]["frameskip"] * config["wm"]["action_dim"]
+    has_real_actions = "action" in config["dataset"]["keys_to_load"]
+    effective_act_dim = None
+    if has_real_actions:
+        if config["wm"]["action_dim"] is None:
+            raise ValueError("ACTION_DIM must be set when training with real action inputs.")
+        effective_act_dim = config["dataset"]["frameskip"] * config["wm"]["action_dim"]
 
     predictor = ARPredictor(
         num_frames=config["wm"]["history_size"],
@@ -267,7 +290,11 @@ def build_model(config: dict):
         output_dim=embed_dim,
         **config["inverse_dynamics"],
     )
-    action_encoder = Embedder(input_dim=effective_act_dim, emb_dim=embed_dim)
+    action_encoder = (
+        Embedder(input_dim=effective_act_dim, emb_dim=embed_dim)
+        if has_real_actions
+        else torch.nn.Identity()
+    )
     projector = MLP(
         input_dim=hidden_dim,
         output_dim=embed_dim,

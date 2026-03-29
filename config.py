@@ -14,8 +14,8 @@ CACHE_DIR = REPO_ROOT / "data" / "stablewm"
 # Training Run
 # =========================
 
-TRAIN_DATASET = "pusht"
-OUTPUT_MODEL_NAME = "lewm"
+TRAIN_DATASET = "mario"
+OUTPUT_MODEL_NAME = "lewm_mario"
 RUN_NAME = None
 
 TRAIN_SPLIT = 0.9
@@ -51,7 +51,6 @@ SAVE_TSV = True
 HISTORY_SIZE = 3
 NUM_PREDS = 1
 EMBED_DIM = 192
-ACTION_DIM = 2
 USE_LEARNED_ACTIONS = True
 
 NUM_CODES = 8
@@ -84,25 +83,20 @@ COMMITMENT_LOSS_WEIGHT = 1.0
 # Change these directly.
 # =========================
 
-DATASET_NAME = "pusht_expert_train"
-DATASET_FRAMESKIP = 5
-DATASET_KEYS_TO_LOAD = ["pixels", "action", "proprio", "state"]
-DATASET_KEYS_TO_CACHE = ["action", "proprio", "state"]
+DATASET_FORMAT = "mario_frames"
+DATASET_NAME = "mariodata"
+DATASET_FRAMESKIP = 1
+DATASET_KEYS_TO_LOAD = ["pixels"]
+DATASET_KEYS_TO_CACHE = []
 DATASET_KEYS_TO_MERGE = {}
 
 # Other examples:
-# DATASET_NAME = "tworoom"
-# DATASET_KEYS_TO_LOAD = ["pixels", "action", "proprio"]
-# DATASET_KEYS_TO_CACHE = ["action", "proprio"]
-
-# DATASET_NAME = "reacher"
-# DATASET_KEYS_TO_LOAD = ["pixels", "action", "observation"]
-# DATASET_KEYS_TO_CACHE = ["action", "observation"]
-
-# DATASET_NAME = "ogbench/cube_single_expert"
-# DATASET_KEYS_TO_LOAD = ["pixels", "action", "observation"]
-# DATASET_KEYS_TO_CACHE = ["action", "observation"]
-# DATASET_KEYS_TO_MERGE = {"proprio": "proprio"}
+# DATASET_FORMAT = "hdf5"
+# DATASET_NAME = "pusht_expert_train"
+# DATASET_FRAMESKIP = 5
+# ACTION_DIM = 2
+# DATASET_KEYS_TO_LOAD = ["pixels", "action", "proprio", "state"]
+# DATASET_KEYS_TO_CACHE = ["action", "proprio", "state"]
 
 
 # =========================
