@@ -14,15 +14,19 @@ _FRAME_RE = re.compile(r"f(\d+)")
 
 
 class MarioFrameSequenceDataset(Dataset):
-    def __init__(self, root: str | Path, num_steps: int, img_size: int = 224):
+    def __init__(self, root: str | Path, num_steps: int, img_size: int | tuple[int, int] = 224):
         self.root = Path(root)
         self.num_steps = num_steps
-        self.img_size = img_size
+        if isinstance(img_size, int):
+            resize_size = (img_size, img_size)
+        else:
+            resize_size = tuple(img_size)
+        self.img_size = resize_size
         self.transform = transforms.Compose(
             [
                 transforms.ToImage(),
                 transforms.ToDtype(torch.float32, scale=True),
-                transforms.Resize((img_size, img_size)),
+                transforms.Resize(self.img_size),
                 transforms.Normalize(
                     mean=(0.485, 0.456, 0.406),
                     std=(0.229, 0.224, 0.225),
