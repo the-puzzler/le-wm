@@ -38,6 +38,7 @@ def build_decoder_config() -> dict:
         "cache_dir": str(cfg.CACHE_DIR),
         "source_checkpoint": cfg.DECODER_SOURCE_CHECKPOINT,
         "source_model_mode": cfg.DECODER_SOURCE_MODEL_MODE,
+        "resume_checkpoint": cfg.DECODER_RESUME_CHECKPOINT,
         "seed": cfg.SEED,
         "img_size": cfg.IMG_SIZE,
         "train_split": cfg.TRAIN_SPLIT,
@@ -455,7 +456,18 @@ def main():
     checkpoint_path = Path(decoder_config["source_checkpoint"]) if decoder_config["source_checkpoint"] else find_latest_checkpoint()
 
     run_dir = create_run_dir(decoder_config)
-    save_run_config({**decoder_config, "source_checkpoint": str(checkpoint_path)}, run_dir)
+    save_run_config(
+        {
+            **decoder_config,
+            "source_checkpoint": str(checkpoint_path),
+            "resume_checkpoint": (
+                str(decoder_config["resume_checkpoint"])
+                if decoder_config["resume_checkpoint"] is not None
+                else None
+            ),
+        },
+        run_dir,
+    )
 
     device = resolve_device(train_config)
     amp_dtype, use_grad_scaler = resolve_amp(device, train_config["trainer"]["precision"])
@@ -469,6 +481,14 @@ def main():
         embed_dim=decoder_config["embed_dim"],
         base_channels=decoder_config["base_channels"],
     ).to(device)
+    if decoder_config["resume_checkpoint"] is not None:
+        resume_path = Path(decoder_config["resume_checkpoint"])
+        state = torch.load(resume_path, map_location=device, weights_only=False)
+        if isinstance(state, dict):
+            decoder.load_state_dict(state)
+        else:
+            decoder.load_state_dict(state.state_dict())
+        print(f"Loaded decoder weights from {resume_path}")
 
     train_loader, val_loader = build_data_loaders(train_config, decoder_config)
 
