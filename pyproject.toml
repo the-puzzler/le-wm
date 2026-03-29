@@ -5,6 +5,7 @@ description = "LeWorldModel training and evaluation code"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "diffusers>=0.30.0",
     "einops>=0.8.0",
     "matplotlib>=3.8.0",
     "numpy>=1.26.0",

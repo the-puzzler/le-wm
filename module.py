@@ -316,6 +316,35 @@ class ActionTranslator(nn.Module):
         return self.net(features)
 
 
+class TAEAdapter(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        latent_channels: int = 4,
+        latent_size: int = 28,
+        hidden_dim: int = 2048,
+    ):
+        super().__init__()
+        self.latent_channels = latent_channels
+        self.latent_size = latent_size
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, latent_channels * latent_size * latent_size),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.net(x)
+        return out.view(
+            x.size(0),
+            self.latent_channels,
+            self.latent_size,
+            self.latent_size,
+        )
+
+
 class MLP(nn.Module):
     """Simple MLP with optional normalization and activation"""
 
