@@ -108,7 +108,7 @@ def main():
     print(f"device: {device}")
     print(f"precision: {config['trainer']['precision']}")
 
-    model = torch.load(checkpoint_path, map_location=device)
+    model = torch.load(checkpoint_path, map_location=device ,weights_only=False)
     model = model.to(device)
 
     sigreg = SIGReg(
