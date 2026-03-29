@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 import config as cfg
+from module import ActionTranslator
 from train import (
     build_train_config,
     build_dataset,
@@ -27,24 +28,6 @@ from train import (
     resolve_device,
 )
 from utils import JsonlLogger, ModelArtifactSaver, TsvLogger
-
-
-class ActionTranslator(nn.Module):
-    def __init__(self, num_codes: int, state_dim: int, action_dim: int, hidden_dim: int):
-        super().__init__()
-        self.code_embedding = nn.Embedding(num_codes, hidden_dim)
-        self.net = nn.Sequential(
-            nn.Linear(hidden_dim + state_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, action_dim),
-        )
-
-    def forward(self, state_emb: torch.Tensor, code_indices: torch.Tensor) -> torch.Tensor:
-        code_emb = self.code_embedding(code_indices)
-        features = torch.cat([state_emb, code_emb], dim=-1)
-        return self.net(features)
 
 
 def build_translator_config() -> dict:
