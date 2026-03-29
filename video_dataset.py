@@ -18,15 +18,19 @@ class MarioFrameSequenceDataset(Dataset):
         self.root = Path(root)
         self.num_steps = num_steps
         if isinstance(img_size, int):
-            resize_size = (img_size, img_size)
+            target_height, target_width = img_size, img_size
         else:
-            resize_size = tuple(img_size)
-        self.img_size = resize_size
+            target_height, target_width = tuple(img_size)
+        self.img_size = (target_height, target_width)
         self.transform = transforms.Compose(
             [
                 transforms.ToImage(),
                 transforms.ToDtype(torch.float32, scale=True),
-                transforms.Resize(self.img_size),
+                transforms.Resize(
+                    size=(target_height, target_width),
+                    interpolation=transforms.InterpolationMode.BILINEAR,
+                    antialias=True,
+                ),
                 transforms.Normalize(
                     mean=(0.485, 0.456, 0.406),
                     std=(0.229, 0.224, 0.225),

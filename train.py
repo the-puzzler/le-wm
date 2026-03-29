@@ -452,6 +452,7 @@ def train_one_epoch(
     global_step_start: int,
     on_step_end,
 ):
+    import time
     import torch
     from tqdm.auto import tqdm
 
@@ -463,17 +464,33 @@ def train_one_epoch(
     running_batches = 0
     epoch_batches = 0
     grad_clip = config["trainer"]["gradient_clip_val"]
+    timing_totals = {
+        "data_wait_s": 0.0,
+        "device_move_s": 0.0,
+        "forward_s": 0.0,
+        "backward_step_s": 0.0,
+        "logging_s": 0.0,
+    }
+    previous_step_end = time.perf_counter()
 
     progress = tqdm(loader, desc=f"train {epoch}", leave=False)
     for batch_idx, batch in enumerate(progress, start=1):
+        batch_ready = time.perf_counter()
+        timing_totals["data_wait_s"] += batch_ready - previous_step_end
         global_step = global_step_start + batch_idx
+
+        move_start = time.perf_counter()
         batch = move_batch_to_device(batch, device)
+        timing_totals["device_move_s"] += time.perf_counter() - move_start
         optimizer.zero_grad(set_to_none=True)
 
+        forward_start = time.perf_counter()
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
             output = lejepa_forward(model, sigreg, batch, config)
             loss = output["loss"]
+        timing_totals["forward_s"] += time.perf_counter() - forward_start
 
+        step_start = time.perf_counter()
         if scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -488,6 +505,7 @@ def train_one_epoch(
             optimizer.step()
         if scheduler is not None:
             scheduler.step()
+        timing_totals["backward_step_s"] += time.perf_counter() - step_start
 
         step_metrics = {
             "loss": output["loss"].detach().item(),
@@ -512,7 +530,9 @@ def train_one_epoch(
             lr=optimizer.param_groups[0]["lr"],
             metrics=step_metrics,
         )
+        logging_start = time.perf_counter()
         on_step_end(row, batch_idx=batch_idx)
+        timing_totals["logging_s"] += time.perf_counter() - logging_start
 
         if batch_idx % max(1, config["logging"]["console_every_steps"]) == 0:
             averaged = average_metrics(running_totals, running_batches)
@@ -524,8 +544,19 @@ def train_one_epoch(
                 commit=f"{averaged['commitment_loss']:.4f}",
                 lr=f"{optimizer.param_groups[0]['lr']:.2e}",
             )
+            print(
+                f"[timing] epoch={epoch} step={global_step} "
+                f"data_wait={timing_totals['data_wait_s']/running_batches:.4f}s "
+                f"device_move={timing_totals['device_move_s']/running_batches:.4f}s "
+                f"forward={timing_totals['forward_s']/running_batches:.4f}s "
+                f"backward_step={timing_totals['backward_step_s']/running_batches:.4f}s "
+                f"logging={timing_totals['logging_s']/running_batches:.4f}s"
+            )
             running_totals = empty_metrics()
             running_batches = 0
+            timing_totals = {key: 0.0 for key in timing_totals}
+
+        previous_step_end = time.perf_counter()
 
     return average_metrics(epoch_totals, epoch_batches)
 
