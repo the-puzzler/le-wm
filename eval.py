@@ -210,6 +210,14 @@ def get_action_chunk_stats(train_config: dict):
     return mean, std
 
 
+def load_checkpoint_run_config(checkpoint_path: Path) -> dict | None:
+    config_path = checkpoint_path.parent / "config.json"
+    if not config_path.exists():
+        return None
+    with config_path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 def load_action_translator(device, train_config: dict, config: dict):
     import torch
 
@@ -218,12 +226,18 @@ def load_action_translator(device, train_config: dict, config: dict):
         if config["translator_checkpoint"]
         else find_latest_translator_checkpoint()
     )
+    run_config = load_checkpoint_run_config(checkpoint_path)
+    hidden_dim = (
+        int(run_config["hidden_dim"])
+        if run_config is not None and "hidden_dim" in run_config
+        else cfg.TRANSLATOR_HIDDEN_DIM
+    )
     action_dim = train_config["dataset"]["frameskip"] * train_config["wm"]["action_dim"]
     translator = ActionTranslator(
         num_codes=train_config["codebook"]["num_codes"],
         state_dim=train_config["wm"]["embed_dim"],
         action_dim=action_dim,
-        hidden_dim=cfg.TRANSLATOR_HIDDEN_DIM,
+        hidden_dim=hidden_dim,
     ).to(device)
 
     payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
