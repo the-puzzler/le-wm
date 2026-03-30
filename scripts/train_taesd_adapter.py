@@ -63,6 +63,7 @@ def build_adapter_config() -> dict:
         "num_vis_samples": cfg.TAESD_NUM_VIS_SAMPLES,
         "latent_loss_weight": cfg.TAESD_LATENT_LOSS_WEIGHT,
         "pixel_loss_weight": cfg.TAESD_PIXEL_LOSS_WEIGHT,
+        "topk_fraction": cfg.TAESD_TOPK_FRACTION,
     }
 
 
@@ -193,13 +194,18 @@ def compute_losses(
     target_images: torch.Tensor,
     latent_loss_weight: float,
     pixel_loss_weight: float,
+    topk_fraction: float,
 ) -> dict[str, torch.Tensor]:
     latent_mse_loss = F.mse_loss(pred_latents, target_latents)
-    pixel_mse_loss = F.mse_loss(recon_images, target_images)
-    loss = latent_loss_weight * latent_mse_loss + pixel_loss_weight * pixel_mse_loss
+    per_pixel_mse = (recon_images - target_images).pow(2).reshape(recon_images.size(0), -1)
+    k = max(1, int(per_pixel_mse.size(1) * topk_fraction))
+    topk_pixel_mse_loss = per_pixel_mse.topk(k=k, dim=1).values.mean()
+    pixel_mse_loss = per_pixel_mse.mean()
+    loss = latent_loss_weight * latent_mse_loss + pixel_loss_weight * topk_pixel_mse_loss
     return {
         "loss": loss,
         "latent_mse_loss": latent_mse_loss,
+        "topk_pixel_mse_loss": topk_pixel_mse_loss,
         "pixel_mse_loss": pixel_mse_loss,
     }
 
@@ -213,6 +219,7 @@ def metrics_row(*, split: str, epoch: int, epoch_step: int, global_step: int, lr
         "lr": lr,
         "loss": metrics["loss"],
         "latent_mse_loss": metrics["latent_mse_loss"],
+        "topk_pixel_mse_loss": metrics["topk_pixel_mse_loss"],
         "pixel_mse_loss": metrics["pixel_mse_loss"],
     }
 
@@ -287,7 +294,7 @@ def save_plots_with_visuals(history: list[dict], output_path: Path, visualizatio
     train_steps = [row["global_step"] for row in train_rows]
     val_steps = [row["global_step"] for row in val_rows]
     if visualization_path is None or not visualization_path.exists():
-        fig, axes = plt.subplots(2, 2, figsize=(12, 8), sharex=True)
+        fig, axes = plt.subplots(3, 2, figsize=(12, 12), sharex=True)
         axes = axes.ravel()
         image_ax = None
     else:
@@ -298,12 +305,14 @@ def save_plots_with_visuals(history: list[dict], output_path: Path, visualizatio
             fig.add_subplot(gs[0, 1]),
             fig.add_subplot(gs[1, 0]),
             fig.add_subplot(gs[1, 1]),
+            fig.add_subplot(gs[2, 0]),
         ]
-        image_ax = fig.add_subplot(gs[2, :])
+        image_ax = fig.add_subplot(gs[2, 1])
 
     plots = [
         ("Total Loss", "loss"),
         ("Latent MSE", "latent_mse_loss"),
+        ("Top-k Pixel MSE", "topk_pixel_mse_loss"),
         ("Pixel MSE", "pixel_mse_loss"),
         ("Learning Rate", "lr"),
     ]
@@ -348,8 +357,8 @@ def train_one_epoch(
     on_step_end,
 ):
     adapter.train()
-    totals = {"loss": 0.0, "latent_mse_loss": 0.0, "pixel_mse_loss": 0.0}
-    running = {"loss": 0.0, "latent_mse_loss": 0.0, "pixel_mse_loss": 0.0}
+    totals = {"loss": 0.0, "latent_mse_loss": 0.0, "topk_pixel_mse_loss": 0.0, "pixel_mse_loss": 0.0}
+    running = {"loss": 0.0, "latent_mse_loss": 0.0, "topk_pixel_mse_loss": 0.0, "pixel_mse_loss": 0.0}
     total_batches = 0
     running_batches = 0
 
@@ -378,6 +387,7 @@ def train_one_epoch(
                 target_images,
                 adapter_config["latent_loss_weight"],
                 adapter_config["pixel_loss_weight"],
+                adapter_config["topk_fraction"],
             )
 
         if scaler is not None:
@@ -418,10 +428,11 @@ def train_one_epoch(
             progress.set_postfix(
                 loss=f"{running['loss'] / running_batches:.4f}",
                 latent=f"{running['latent_mse_loss'] / running_batches:.4f}",
+                topk=f"{running['topk_pixel_mse_loss'] / running_batches:.4f}",
                 pixel=f"{running['pixel_mse_loss'] / running_batches:.4f}",
                 lr=f"{optimizer.param_groups[0]['lr']:.2e}",
             )
-            running = {"loss": 0.0, "latent_mse_loss": 0.0, "pixel_mse_loss": 0.0}
+            running = {"loss": 0.0, "latent_mse_loss": 0.0, "topk_pixel_mse_loss": 0.0, "pixel_mse_loss": 0.0}
             running_batches = 0
 
     return average_metrics(totals, total_batches)
@@ -441,7 +452,7 @@ def evaluate_adapter(
     global_step: int,
 ):
     adapter.eval()
-    totals = {"loss": 0.0, "latent_mse_loss": 0.0, "pixel_mse_loss": 0.0}
+    totals = {"loss": 0.0, "latent_mse_loss": 0.0, "topk_pixel_mse_loss": 0.0, "pixel_mse_loss": 0.0}
     total_batches = 0
 
     with torch.no_grad():

@@ -109,7 +109,7 @@ DATASET_KEYS_TO_MERGE = {}
 # Decoder Training
 # =========================
 
-DECODER_SOURCE_CHECKPOINT = None
+DECODER_SOURCE_CHECKPOINT = "/workspace/le-wm/runs/20260328-132542-pusht/lewm_epoch_8_object.ckpt"
 DECODER_SOURCE_MODEL_MODE = "train"
 DECODER_RESUME_CHECKPOINT = None
 
@@ -171,6 +171,7 @@ TAESD_SAVE_TSV = True
 TAESD_NUM_VIS_SAMPLES = 4
 TAESD_LATENT_LOSS_WEIGHT = 1.0
 TAESD_PIXEL_LOSS_WEIGHT = 0.25
+TAESD_TOPK_FRACTION = 0.025
 
 
 # =========================
@@ -218,7 +219,7 @@ EVAL_BUDGET = 50 # 50 original i think
 EVAL_IMG_SIZE = 224
 EVAL_USE_ACTION_TRANSLATOR = True
 EVAL_TRANSLATOR_CHECKPOINT = "/workspace/le-wm/runs/20260330-104740-action-translator/lewm_action_translator_epoch_1_object.ckpt"
-EVAL_TRANSLATOR_ACTION_SCALE = 0.75
+EVAL_TRANSLATOR_ACTION_SCALE = 1.0
 
 PLAN_HORIZON = 5
 PLAN_RECEDING_HORIZON = 5
