@@ -210,14 +210,14 @@ TRANSLATOR_ANALYSIS_RUN_NAME = "action-code-analysis"
 # Evaluation
 # =========================
 
-EVAL_POLICY = "random"
+EVAL_POLICY = "/home/matteo/Documents/le-wm/runs/20260328-132542-pusht/lewm_epoch_13_object.ckpt"
 EVAL_SEED = 42
-EVAL_NUM = 50
+EVAL_NUM = 1
 EVAL_GOAL_OFFSET_STEPS = 25
 EVAL_BUDGET = 50
 EVAL_IMG_SIZE = 224
 EVAL_USE_ACTION_TRANSLATOR = True
-EVAL_TRANSLATOR_CHECKPOINT = None
+EVAL_TRANSLATOR_CHECKPOINT = "/home/matteo/Documents/le-wm/runs/20260329-124715-action-translator/lewm_action_translator_epoch_5_weights.ckpt"
 
 PLAN_HORIZON = 5
 PLAN_RECEDING_HORIZON = 5

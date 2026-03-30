@@ -153,6 +153,29 @@ def build_solver(model, config: dict):
     raise ValueError(f"Unsupported solver type: {solver_cfg['type']}")
 
 
+def load_cost_model(policy_name: str):
+    import torch
+    import stable_worldmodel as swm
+
+    policy_path = Path(policy_name).expanduser()
+    if policy_path.suffix == ".ckpt" and policy_path.exists():
+        model = torch.load(policy_path, map_location="cpu", weights_only=False)
+        model = model.to("cuda")
+        model = model.eval()
+        model.requires_grad_(False)
+        model.interpolate_pos_encoding = True
+        results_path = policy_path.parent
+        return model, results_path
+
+    model = swm.policy.AutoCostModel(policy_name)
+    model = model.to("cuda")
+    model = model.eval()
+    model.requires_grad_(False)
+    model.interpolate_pos_encoding = True
+    results_path = Path(swm.data.utils.get_cache_dir(), policy_name).parent
+    return model, results_path
+
+
 def find_latest_translator_checkpoint() -> Path:
     runs_dir = Path(cfg.RUNS_DIR)
     weight_candidates = sorted(
@@ -241,7 +264,11 @@ class LatentActionCostModel:
         return moved
 
     def _encode_goal(self, info_dict: dict):
-        goal = {k: v[:, 0] for k, v in info_dict.items() if hasattr(v, "shape")}
+        goal = {
+            k: v[:, 0]
+            for k, v in info_dict.items()
+            if hasattr(v, "shape") and getattr(v, "ndim", 0) >= 2
+        }
         goal["pixels"] = goal["goal"]
         for key in list(goal.keys()):
             if key.startswith("goal_"):
@@ -250,7 +277,12 @@ class LatentActionCostModel:
         return self.model.encode(goal)["emb"][:, -1]
 
     def _encode_init(self, info_dict: dict):
-        init = {k: v[:, 0] for k, v in info_dict.items() if hasattr(v, "shape")}
+        init = {
+            k: v[:, 0]
+            for k, v in info_dict.items()
+            if hasattr(v, "shape") and getattr(v, "ndim", 0) >= 2
+        }
+        init.pop("action", None)
         return self.model.encode(init)["emb"]
 
     def _quantize_candidates(self, action_candidates):
@@ -426,7 +458,9 @@ def main():
     if config["plan"]["horizon"] * config["plan"]["action_block"] > config["eval_budget"]:
         raise ValueError("Planning horizon must be smaller than or equal to eval_budget")
 
-    world_kwargs = dict(config["world"])
+    world_kwargs = {
+        key: value for key, value in config["world"].items() if value is not None
+    }
     world_kwargs["num_envs"] = config["eval_num"]
     world_kwargs["max_episode_steps"] = 2 * config["eval_budget"]
     world = swm.World(**world_kwargs, image_shape=(224, 224))
@@ -456,11 +490,7 @@ def main():
     train_config = build_train_config()
     policy_name = config["policy"]
     if policy_name != "random":
-        model = swm.policy.AutoCostModel(policy_name)
-        model = model.to("cuda")
-        model = model.eval()
-        model.requires_grad_(False)
-        model.interpolate_pos_encoding = True
+        model, results_path = load_cost_model(policy_name)
         if config["use_action_translator"]:
             if not train_config["wm"]["use_learned_actions"]:
                 raise ValueError("Action translator eval requires USE_LEARNED_ACTIONS = True in config.py.")
@@ -511,7 +541,6 @@ def main():
                 process=process,
                 transform=transform,
             )
-        results_path = Path(swm.data.utils.get_cache_dir(), policy_name).parent
     else:
         policy = swm.policy.RandomPolicy()
         results_path = Path(__file__).parent
