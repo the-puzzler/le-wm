@@ -61,6 +61,7 @@ def build_decoder_config() -> dict:
         "save_tsv": cfg.DECODER_SAVE_TSV,
         "num_vis_samples": cfg.DECODER_NUM_VIS_SAMPLES,
         "topk_fraction": cfg.DECODER_TOPK_FRACTION,
+        "lpips_weight": cfg.DECODER_LPIPS_WEIGHT,
     }
 
 
@@ -170,15 +171,28 @@ def extract_latents(source_model, batch: dict, train_config: dict):
     return emb, pred_emb
 
 
-def compute_decoder_losses(recon: torch.Tensor, target: torch.Tensor, topk_fraction: float) -> dict[str, torch.Tensor]:
+def compute_decoder_losses(
+    recon: torch.Tensor,
+    target: torch.Tensor,
+    topk_fraction: float,
+    lpips_model=None,
+    lpips_weight: float = 0.0,
+) -> dict[str, torch.Tensor]:
     per_pixel_mse = (recon - target).pow(2).reshape(recon.size(0), -1)
     k = max(1, int(per_pixel_mse.size(1) * topk_fraction))
     topk_mse_loss = per_pixel_mse.topk(k=k, dim=1).values.mean()
     mse_loss = per_pixel_mse.mean()
+    lpips_loss = recon.new_zeros(())
+    if lpips_model is not None and lpips_weight > 0.0:
+        recon_for_lpips = denormalize_pixels(recon.float())
+        target_for_lpips = denormalize_pixels(target.float())
+        lpips_loss = lpips_model(recon_for_lpips, target_for_lpips)
+    loss = topk_mse_loss + lpips_weight * lpips_loss
     return {
-        "loss": topk_mse_loss,
+        "loss": loss,
         "topk_mse_loss": topk_mse_loss,
         "mse_loss": mse_loss,
+        "lpips_loss": lpips_loss,
     }
 
 
@@ -192,6 +206,7 @@ def metrics_row(*, split: str, epoch: int, epoch_step: int, global_step: int, lr
         "loss": metrics["loss"],
         "topk_mse_loss": metrics["topk_mse_loss"],
         "mse_loss": metrics["mse_loss"],
+        "lpips_loss": metrics["lpips_loss"],
     }
 
 
@@ -257,7 +272,7 @@ def save_decoder_plots_with_visuals(history: list[dict], output_path: Path, visu
     train_steps = [row["global_step"] for row in train_rows]
     val_steps = [row["global_step"] for row in val_rows]
     if visualization_path is None or not visualization_path.exists():
-        fig, axes = plt.subplots(2, 2, figsize=(12, 8), sharex=True)
+        fig, axes = plt.subplots(3, 2, figsize=(12, 12), sharex=True)
         axes = axes.ravel()
         image_ax = None
     else:
@@ -268,13 +283,15 @@ def save_decoder_plots_with_visuals(history: list[dict], output_path: Path, visu
             fig.add_subplot(gs[0, 1]),
             fig.add_subplot(gs[1, 0]),
             fig.add_subplot(gs[1, 1]),
+            fig.add_subplot(gs[2, 0]),
         ]
-        image_ax = fig.add_subplot(gs[2, :])
+        image_ax = fig.add_subplot(gs[2, 1])
 
     plots = [
         ("Total Loss", "loss"),
         ("Top-k MSE Loss", "topk_mse_loss"),
         ("MSE Loss", "mse_loss"),
+        ("LPIPS Loss", "lpips_loss"),
         ("Learning Rate", "lr"),
     ]
 
@@ -331,6 +348,7 @@ def train_one_epoch(
     optimizer,
     scheduler,
     scaler,
+    lpips_model,
     device,
     amp_dtype,
     train_config: dict,
@@ -340,8 +358,8 @@ def train_one_epoch(
     on_step_end,
 ):
     decoder.train()
-    totals = {"loss": 0.0, "topk_mse_loss": 0.0, "mse_loss": 0.0}
-    running = {"loss": 0.0, "topk_mse_loss": 0.0, "mse_loss": 0.0}
+    totals = {"loss": 0.0, "topk_mse_loss": 0.0, "mse_loss": 0.0, "lpips_loss": 0.0}
+    running = {"loss": 0.0, "topk_mse_loss": 0.0, "mse_loss": 0.0, "lpips_loss": 0.0}
     total_batches = 0
     running_batches = 0
 
@@ -359,7 +377,13 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
             recon = decoder(latent)
-            losses = compute_decoder_losses(recon, target, decoder_config["topk_fraction"])
+            losses = compute_decoder_losses(
+                recon,
+                target,
+                decoder_config["topk_fraction"],
+                lpips_model=lpips_model,
+                lpips_weight=decoder_config["lpips_weight"],
+            )
 
         if scaler is not None:
             scaler.scale(losses["loss"]).backward()
@@ -400,9 +424,10 @@ def train_one_epoch(
                 loss=f"{running['loss'] / running_batches:.4f}",
                 topk=f"{running['topk_mse_loss'] / running_batches:.4f}",
                 mse=f"{running['mse_loss'] / running_batches:.4f}",
+                lpips=f"{running['lpips_loss'] / running_batches:.4f}",
                 lr=f"{optimizer.param_groups[0]['lr']:.2e}",
             )
-            running = {"loss": 0.0, "topk_mse_loss": 0.0, "mse_loss": 0.0}
+            running = {"loss": 0.0, "topk_mse_loss": 0.0, "mse_loss": 0.0, "lpips_loss": 0.0}
             running_batches = 0
 
     return average_metrics(totals, total_batches)
@@ -415,13 +440,14 @@ def evaluate_decoder(
     loader,
     device,
     amp_dtype,
+    lpips_model,
     train_config: dict,
     decoder_config: dict,
     epoch: int,
     global_step: int,
 ):
     decoder.eval()
-    totals = {"loss": 0.0, "topk_mse_loss": 0.0, "mse_loss": 0.0}
+    totals = {"loss": 0.0, "topk_mse_loss": 0.0, "mse_loss": 0.0, "lpips_loss": 0.0}
     total_batches = 0
 
     with torch.no_grad():
@@ -432,7 +458,13 @@ def evaluate_decoder(
                 latent = emb.reshape(-1, emb.size(-1))
                 target = batch["pixels"].reshape(-1, *batch["pixels"].shape[2:])
                 recon = decoder(latent)
-                losses = compute_decoder_losses(recon, target, decoder_config["topk_fraction"])
+                losses = compute_decoder_losses(
+                recon,
+                target,
+                decoder_config["topk_fraction"],
+                lpips_model=lpips_model,
+                lpips_weight=decoder_config["lpips_weight"],
+            )
 
             for key, value in losses.items():
                 totals[key] += value.detach().item()
@@ -471,6 +503,14 @@ def main():
 
     device = resolve_device(train_config)
     amp_dtype, use_grad_scaler = resolve_amp(device, train_config["trainer"]["precision"])
+
+    lpips_model = None
+    if decoder_config["lpips_weight"] > 0.0:
+        from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+
+        lpips_model = LearnedPerceptualImagePatchSimilarity(net_type="alex", normalize=True).to(device)
+        lpips_model.eval()
+        lpips_model.requires_grad_(False)
 
     source_model = torch.load(checkpoint_path, map_location=device, weights_only=False)
     source_model = source_model.to(device)
@@ -552,6 +592,7 @@ def main():
             optimizer=optimizer,
             scheduler=scheduler,
             scaler=scaler,
+            lpips_model=lpips_model,
             device=device,
             amp_dtype=amp_dtype,
             train_config=train_config,
@@ -572,6 +613,7 @@ def main():
             loader=val_loader,
             device=device,
             amp_dtype=amp_dtype,
+            lpips_model=lpips_model,
             train_config=train_config,
             decoder_config=decoder_config,
             epoch=epoch,
