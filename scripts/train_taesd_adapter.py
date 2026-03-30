@@ -491,7 +491,7 @@ def evaluate_adapter(
 
 def main():
     try:
-        from diffusers import AutoencoderTiny
+        from diffusers import AutoencoderKL, AutoencoderTiny
     except ModuleNotFoundError as exc:  # pragma: no cover
         raise ModuleNotFoundError(
             "diffusers is required for TAESD adapter training. Install dependencies first."
@@ -518,7 +518,10 @@ def main():
     freeze_module(source_model)
     set_source_model_mode(source_model, adapter_config["source_model_mode"])
 
-    taesd = AutoencoderTiny.from_pretrained(adapter_config["taesd_model_name"]).to(device)
+    try:
+        taesd = AutoencoderTiny.from_pretrained(adapter_config["taesd_model_name"]).to(device)
+    except Exception:
+        taesd = AutoencoderKL.from_pretrained(adapter_config["taesd_model_name"]).to(device)
     taesd.eval()
     freeze_module(taesd)
 
