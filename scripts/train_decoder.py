@@ -328,7 +328,6 @@ def save_reconstruction_visualization(
     loader,
     device,
     amp_dtype,
-    lpips_model,
     train_config: dict,
     decoder_config: dict,
     output_path: Path,
