@@ -62,6 +62,8 @@ def build_decoder_config() -> dict:
         "num_vis_samples": cfg.DECODER_NUM_VIS_SAMPLES,
         "topk_fraction": cfg.DECODER_TOPK_FRACTION,
         "lpips_weight": cfg.DECODER_LPIPS_WEIGHT,
+        "mse_weight": cfg.DECODER_MSE_WEIGHT,
+        "topk_weight": cfg.DECODER_TOPK_WEIGHT,
     }
 
 
@@ -175,6 +177,8 @@ def compute_decoder_losses(
     recon: torch.Tensor,
     target: torch.Tensor,
     topk_fraction: float,
+    mse_weight: float,
+    topk_weight: float,
     lpips_model=None,
     lpips_weight: float = 0.0,
 ) -> dict[str, torch.Tensor]:
@@ -187,7 +191,7 @@ def compute_decoder_losses(
         recon_for_lpips = denormalize_pixels(recon.float())
         target_for_lpips = denormalize_pixels(target.float())
         lpips_loss = lpips_model(recon_for_lpips, target_for_lpips)
-    loss = topk_mse_loss + lpips_weight * lpips_loss
+    loss = mse_weight * mse_loss + topk_weight * topk_mse_loss + lpips_weight * lpips_loss
     return {
         "loss": loss,
         "topk_mse_loss": topk_mse_loss,
@@ -381,6 +385,8 @@ def train_one_epoch(
                 recon,
                 target,
                 decoder_config["topk_fraction"],
+                decoder_config["mse_weight"],
+                decoder_config["topk_weight"],
                 lpips_model=lpips_model,
                 lpips_weight=decoder_config["lpips_weight"],
             )
@@ -462,6 +468,8 @@ def evaluate_decoder(
                 recon,
                 target,
                 decoder_config["topk_fraction"],
+                decoder_config["mse_weight"],
+                decoder_config["topk_weight"],
                 lpips_model=lpips_model,
                 lpips_weight=decoder_config["lpips_weight"],
             )
