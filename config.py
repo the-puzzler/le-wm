@@ -177,18 +177,18 @@ TAESD_PIXEL_LOSS_WEIGHT = 0.25
 # Action Translator Training
 # =========================
 
-TRANSLATOR_SOURCE_CHECKPOINT = None
+TRANSLATOR_SOURCE_CHECKPOINT = "/workspace/le-wm/runs/20260328-132542-pusht/lewm_epoch_8_object.ckpt"
 TRANSLATOR_SOURCE_MODEL_MODE = "train"
-
+TRANSLATOR_RESUME_CHECKPOINT = "/workspace/le-wm/runs/20260329-124715-action-translator/lewm_action_translator_epoch_5_object.ckpt"
 TRANSLATOR_RUN_NAME = "action-translator"
 TRANSLATOR_MAX_EPOCHS = 13
-TRANSLATOR_BATCH_SIZE = 16
-TRANSLATOR_NUM_WORKERS = 6
+TRANSLATOR_BATCH_SIZE = 256
+TRANSLATOR_NUM_WORKERS = 12
 TRANSLATOR_PERSISTENT_WORKERS = True
 TRANSLATOR_PREFETCH_FACTOR = 3
 TRANSLATOR_PIN_MEMORY = True
 
-TRANSLATOR_LEARNING_RATE = 1e-4
+TRANSLATOR_LEARNING_RATE = 1e-3
 TRANSLATOR_WEIGHT_DECAY = 1e-4
 TRANSLATOR_GRADIENT_CLIP_VAL = 1.0
 
@@ -196,7 +196,7 @@ TRANSLATOR_HIDDEN_DIM = 256
 
 TRANSLATOR_CONSOLE_EVERY_STEPS = 20
 TRANSLATOR_WRITE_EVERY_STEPS = 100
-TRANSLATOR_PLOT_EVERY_STEPS = 100
+TRANSLATOR_PLOT_EVERY_STEPS = 500
 TRANSLATOR_PLOT_EVERY_EPOCHS = 1
 TRANSLATOR_SAVE_TSV = True
 
@@ -210,14 +210,15 @@ TRANSLATOR_ANALYSIS_RUN_NAME = "action-code-analysis"
 # Evaluation
 # =========================
 
-EVAL_POLICY = "/home/matteo/Documents/le-wm/runs/20260328-132542-pusht/lewm_epoch_13_object.ckpt"
+EVAL_POLICY = "/workspace/le-wm/runs/20260328-132542-pusht/lewm_epoch_8_object.ckpt"
 EVAL_SEED = 42
-EVAL_NUM = 1
+EVAL_NUM = 20
 EVAL_GOAL_OFFSET_STEPS = 25
-EVAL_BUDGET = 100 # 50 original i think
+EVAL_BUDGET = 50 # 50 original i think
 EVAL_IMG_SIZE = 224
 EVAL_USE_ACTION_TRANSLATOR = True
-EVAL_TRANSLATOR_CHECKPOINT = "/home/matteo/Documents/le-wm/runs/20260329-124715-action-translator/lewm_action_translator_epoch_5_weights.ckpt"
+EVAL_TRANSLATOR_CHECKPOINT = "/workspace/le-wm/runs/20260330-104740-action-translator/lewm_action_translator_epoch_1_object.ckpt"
+EVAL_TRANSLATOR_ACTION_SCALE = 0.75
 
 PLAN_HORIZON = 5
 PLAN_RECEDING_HORIZON = 5

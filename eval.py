@@ -33,6 +33,7 @@ def build_eval_config() -> dict:
         "policy": cfg.EVAL_POLICY,
         "use_action_translator": cfg.EVAL_USE_ACTION_TRANSLATOR,
         "translator_checkpoint": cfg.EVAL_TRANSLATOR_CHECKPOINT,
+        "translator_action_scale": cfg.EVAL_TRANSLATOR_ACTION_SCALE,
         "world": {
             "env_name": cfg.EVAL_WORLD_ENV_NAME,
             "history_size": cfg.EVAL_WORLD_HISTORY_SIZE,
@@ -226,10 +227,12 @@ def load_action_translator(device, train_config: dict, config: dict):
     ).to(device)
 
     payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    if isinstance(payload, dict):
-        translator.load_state_dict(payload)
-    else:
-        translator.load_state_dict(payload.state_dict())
+    state_dict = payload if isinstance(payload, dict) else payload.state_dict()
+    if any(key.startswith("_orig_mod.") for key in state_dict):
+        state_dict = {
+            key.removeprefix("_orig_mod."): value for key, value in state_dict.items()
+        }
+    translator.load_state_dict(state_dict)
     translator.eval()
     translator.requires_grad_(False)
     return translator, checkpoint_path
@@ -247,6 +250,7 @@ class LatentActionCostModel:
         real_action_dim: int,
         action_chunk_mean,
         action_chunk_std,
+        translator_action_scale: float,
     ):
         self.model = model
         self.translator = translator
@@ -257,6 +261,7 @@ class LatentActionCostModel:
         self.device = next(model.parameters()).device
         self.action_chunk_mean = action_chunk_mean.to(self.device)
         self.action_chunk_std = action_chunk_std.to(self.device)
+        self.translator_action_scale = float(translator_action_scale)
 
     def _move_info(self, info_dict: dict):
         import torch
@@ -321,6 +326,7 @@ class LatentActionCostModel:
             if decode_actions:
                 decoded = self.translator(emb[:, -1], current_code)
                 decoded = decoded * self.action_chunk_std + self.action_chunk_mean
+                decoded = decoded * self.translator_action_scale
                 decoded_chunks.append(decoded.view(-1, self.real_action_block, self.real_action_dim))
 
             code_hist = flat_codes[:, : t + 1]
@@ -522,6 +528,7 @@ def main():
                 real_action_dim=train_config["wm"]["action_dim"],
                 action_chunk_mean=action_chunk_mean,
                 action_chunk_std=action_chunk_std,
+                translator_action_scale=config["translator_action_scale"],
             )
             latent_plan_config = swm.PlanConfig(
                 horizon=config["plan"]["horizon"],

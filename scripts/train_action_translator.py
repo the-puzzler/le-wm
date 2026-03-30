@@ -23,6 +23,7 @@ from train import (
     build_train_config,
     build_dataset,
     build_scheduler,
+    maybe_compile_model,
     move_batch_to_device,
     resolve_amp,
     resolve_device,
@@ -37,6 +38,7 @@ def build_translator_config() -> dict:
         "cache_dir": str(cfg.CACHE_DIR),
         "source_checkpoint": cfg.TRANSLATOR_SOURCE_CHECKPOINT,
         "source_model_mode": cfg.TRANSLATOR_SOURCE_MODEL_MODE,
+        "resume_checkpoint": cfg.TRANSLATOR_RESUME_CHECKPOINT,
         "seed": cfg.SEED,
         "train_split": cfg.TRAIN_SPLIT,
         "output_model_name": f"{cfg.OUTPUT_MODEL_NAME}_action_translator",
@@ -434,7 +436,18 @@ def main():
     )
 
     run_dir = create_run_dir(translator_config)
-    save_run_config({**translator_config, "source_checkpoint": str(checkpoint_path)}, run_dir)
+    save_run_config(
+        {
+            **translator_config,
+            "source_checkpoint": str(checkpoint_path),
+            "resume_checkpoint": (
+                str(translator_config["resume_checkpoint"])
+                if translator_config["resume_checkpoint"] is not None
+                else None
+            ),
+        },
+        run_dir,
+    )
 
     device = resolve_device(train_config)
     amp_dtype, use_grad_scaler = resolve_amp(device, train_config["trainer"]["precision"])
@@ -451,6 +464,17 @@ def main():
         action_dim=action_dim,
         hidden_dim=translator_config["hidden_dim"],
     ).to(device)
+    if translator_config["resume_checkpoint"] is not None:
+        resume_path = Path(translator_config["resume_checkpoint"])
+        state = torch.load(resume_path, map_location=device, weights_only=False)
+        state_dict = state if isinstance(state, dict) else state.state_dict()
+        if any(key.startswith("_orig_mod.") for key in state_dict):
+            state_dict = {
+                key.removeprefix("_orig_mod."): value for key, value in state_dict.items()
+            }
+        translator.load_state_dict(state_dict)
+        print(f"Loaded action translator weights from {resume_path}")
+    translator = maybe_compile_model(translator, train_config)
 
     train_loader, val_loader = build_data_loaders(train_config, translator_config)
 
