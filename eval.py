@@ -203,6 +203,9 @@ def get_action_chunk_stats(train_config: dict):
     actions = actions[~torch.isnan(actions).any(dim=1)]
     mean = actions.mean(0, keepdim=True).float()
     std = actions.std(0, keepdim=True).float()
+    frameskip = int(train_config["dataset"]["frameskip"])
+    mean = mean.repeat(1, frameskip).reshape(1, -1)
+    std = std.repeat(1, frameskip).reshape(1, -1)
     return mean, std
 
 
@@ -260,16 +263,24 @@ class LatentActionCostModel:
 
         moved = {}
         for key, value in info_dict.items():
-            moved[key] = value.to(self.device) if torch.is_tensor(value) else value
+                moved[key] = value.to(self.device) if torch.is_tensor(value) else value
         return moved
+
+    def _select_sequence_view(self, value):
+        ndim = getattr(value, "ndim", 0)
+        if ndim >= 6:
+            return value[:, 0]
+        return value
 
     def _encode_goal(self, info_dict: dict):
         goal = {
-            k: v[:, 0]
+            k: self._select_sequence_view(v)
             for k, v in info_dict.items()
             if hasattr(v, "shape") and getattr(v, "ndim", 0) >= 2
         }
         goal["pixels"] = goal["goal"]
+        if getattr(goal["pixels"], "ndim", 0) == 4:
+            goal["pixels"] = goal["pixels"][:, None]
         for key in list(goal.keys()):
             if key.startswith("goal_"):
                 goal[key[len("goal_") :]] = goal.pop(key)
@@ -278,10 +289,12 @@ class LatentActionCostModel:
 
     def _encode_init(self, info_dict: dict):
         init = {
-            k: v[:, 0]
+            k: self._select_sequence_view(v)
             for k, v in info_dict.items()
             if hasattr(v, "shape") and getattr(v, "ndim", 0) >= 2
         }
+        if "pixels" in init and getattr(init["pixels"], "ndim", 0) == 4:
+            init["pixels"] = init["pixels"][:, None]
         init.pop("action", None)
         return self.model.encode(init)["emb"]
 
