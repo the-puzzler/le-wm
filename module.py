@@ -299,16 +299,33 @@ class VisualDecoder(nn.Module):
 
 
 class ActionTranslator(nn.Module):
-    def __init__(self, num_codes: int, state_dim: int, action_dim: int, hidden_dim: int):
+    def __init__(
+        self,
+        num_codes: int,
+        state_dim: int,
+        action_dim: int,
+        hidden_dim: int,
+        num_hidden_layers: int = 2,
+    ):
         super().__init__()
+        if num_hidden_layers < 1:
+            raise ValueError("num_hidden_layers must be >= 1")
+
         self.code_embedding = nn.Embedding(num_codes, hidden_dim)
-        self.net = nn.Sequential(
+
+        layers = [
             nn.Linear(hidden_dim + state_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, action_dim),
-        )
+        ]
+        for _ in range(num_hidden_layers - 1):
+            layers.extend(
+                [
+                    nn.Linear(hidden_dim, hidden_dim),
+                    nn.GELU(),
+                ]
+            )
+        layers.append(nn.Linear(hidden_dim, action_dim))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, state_emb: torch.Tensor, code_indices: torch.Tensor) -> torch.Tensor:
         code_emb = self.code_embedding(code_indices)

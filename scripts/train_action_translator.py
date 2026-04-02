@@ -52,6 +52,7 @@ def build_translator_config() -> dict:
         "weight_decay": cfg.TRANSLATOR_WEIGHT_DECAY,
         "gradient_clip_val": cfg.TRANSLATOR_GRADIENT_CLIP_VAL,
         "hidden_dim": cfg.TRANSLATOR_HIDDEN_DIM,
+        "num_hidden_layers": cfg.TRANSLATOR_NUM_HIDDEN_LAYERS,
         "console_every_steps": cfg.TRANSLATOR_CONSOLE_EVERY_STEPS,
         "write_every_steps": cfg.TRANSLATOR_WRITE_EVERY_STEPS,
         "plot_every_steps": cfg.TRANSLATOR_PLOT_EVERY_STEPS,
@@ -463,6 +464,7 @@ def main():
         state_dim=train_config["wm"]["embed_dim"],
         action_dim=action_dim,
         hidden_dim=translator_config["hidden_dim"],
+        num_hidden_layers=translator_config["num_hidden_layers"],
     ).to(device)
     if translator_config["resume_checkpoint"] is not None:
         resume_path = Path(translator_config["resume_checkpoint"])

@@ -232,12 +232,18 @@ def load_action_translator(device, train_config: dict, config: dict):
         if run_config is not None and "hidden_dim" in run_config
         else cfg.TRANSLATOR_HIDDEN_DIM
     )
+    num_hidden_layers = (
+        int(run_config["num_hidden_layers"])
+        if run_config is not None and "num_hidden_layers" in run_config
+        else cfg.TRANSLATOR_NUM_HIDDEN_LAYERS
+    )
     action_dim = train_config["dataset"]["frameskip"] * train_config["wm"]["action_dim"]
     translator = ActionTranslator(
         num_codes=train_config["codebook"]["num_codes"],
         state_dim=train_config["wm"]["embed_dim"],
         action_dim=action_dim,
         hidden_dim=hidden_dim,
+        num_hidden_layers=num_hidden_layers,
     ).to(device)
 
     payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
