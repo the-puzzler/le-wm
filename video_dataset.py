@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import re
+from collections import OrderedDict
 from pathlib import Path
 
-import numpy as np
 import torch
-from PIL import Image
 from torch.utils.data import Dataset
+from torchvision.io import ImageReadMode, read_image
 from torchvision.transforms import v2 as transforms
 
 
@@ -14,17 +14,24 @@ _FRAME_RE = re.compile(r"f(\d+)")
 
 
 class MarioFrameSequenceDataset(Dataset):
-    def __init__(self, root: str | Path, num_steps: int, img_size: int | tuple[int, int] = 224):
+    def __init__(
+        self,
+        root: str | Path,
+        num_steps: int,
+        img_size: int | tuple[int, int] = 224,
+        frame_cache_size: int = 128,
+    ):
         self.root = Path(root)
         self.num_steps = num_steps
+        self.frame_cache_size = max(0, int(frame_cache_size))
         if isinstance(img_size, int):
             target_height, target_width = img_size, img_size
         else:
             target_height, target_width = tuple(img_size)
         self.img_size = (target_height, target_width)
+        self._frame_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
         self.transform = transforms.Compose(
             [
-                transforms.ToImage(),
                 transforms.ToDtype(torch.float32, scale=True),
                 transforms.Resize(
                     size=(target_height, target_width),
@@ -75,12 +82,25 @@ class MarioFrameSequenceDataset(Dataset):
     def __len__(self) -> int:
         return len(self.sequences)
 
+    def _load_frame(self, path: Path) -> torch.Tensor:
+        cache_key = path.as_posix()
+        cached = self._frame_cache.get(cache_key)
+        if cached is not None:
+            self._frame_cache.move_to_end(cache_key)
+            return cached
+
+        frame = read_image(str(path), mode=ImageReadMode.RGB)
+        frame = self.transform(frame)
+
+        if self.frame_cache_size > 0:
+            self._frame_cache[cache_key] = frame
+            self._frame_cache.move_to_end(cache_key)
+            while len(self._frame_cache) > self.frame_cache_size:
+                self._frame_cache.popitem(last=False)
+
+        return frame
+
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
-        frames = []
-        for path in self.sequences[index]:
-            with Image.open(path) as image:
-                image = image.convert("RGB")
-                frame = self.transform(np.array(image))
-            frames.append(frame)
+        frames = [self._load_frame(path) for path in self.sequences[index]]
         pixels = torch.stack(frames, dim=0)
         return {"pixels": pixels}
