@@ -19,12 +19,14 @@ from tqdm.auto import tqdm
 
 import config as cfg
 from module import ActionTranslator
+from script_utils import find_latest_object_checkpoint, freeze_model, set_source_model_mode
 from train import (
     build_train_config,
     build_dataset,
     build_scheduler,
     maybe_compile_model,
     move_batch_to_device,
+    override_dataset_columns,
     resolve_amp,
     resolve_device,
 )
@@ -79,21 +81,6 @@ def save_run_config(config: dict, run_dir: Path) -> None:
         json.dump(serializable, f, indent=2)
 
 
-def find_latest_checkpoint() -> Path:
-    runs_dir = Path(cfg.RUNS_DIR)
-    candidates = sorted(
-        [
-            path
-            for path in runs_dir.glob("*/*_object.ckpt")
-            if "_decoder" not in path.name and "_translator" not in path.name
-        ],
-        key=lambda path: path.stat().st_mtime,
-    )
-    if not candidates:
-        raise FileNotFoundError(f"No object checkpoints found under: {runs_dir}")
-    return candidates[-1]
-
-
 def build_data_loaders(train_config: dict, translator_config: dict):
     import stable_pretraining as spt
 
@@ -129,24 +116,6 @@ def build_data_loaders(train_config: dict, translator_config: dict):
         **loader_kwargs,
     )
     return train_loader, val_loader
-
-
-def set_source_model_mode(model, mode: str):
-    if mode == "train":
-        model.train()
-        for module in model.modules():
-            if isinstance(module, nn.Dropout):
-                module.eval()
-    elif mode == "eval":
-        model.eval()
-    else:
-        raise ValueError(f"Unsupported TRANSLATOR_SOURCE_MODEL_MODE: {mode}")
-
-
-def freeze_source_model(model):
-    for param in model.parameters():
-        param.requires_grad_(False)
-
 
 def extract_translator_targets(source_model, batch: dict, train_config: dict):
     batch = dict(batch)
@@ -425,7 +394,12 @@ def evaluate_translator(
 def main():
     torch.manual_seed(cfg.SEED)
 
-    train_config = build_train_config()
+    train_config = override_dataset_columns(
+        build_train_config(),
+        keys_to_load=["pixels", "action"],
+        keys_to_cache=["action"],
+        keys_to_merge={},
+    )
     if not train_config["wm"]["use_learned_actions"]:
         raise ValueError("Action translator is only needed when USE_LEARNED_ACTIONS = True.")
 
@@ -433,7 +407,7 @@ def main():
     checkpoint_path = (
         Path(translator_config["source_checkpoint"])
         if translator_config["source_checkpoint"]
-        else find_latest_checkpoint()
+        else find_latest_object_checkpoint(cfg.RUNS_DIR, exclude_name_substrings=("_decoder", "_translator"))
     )
 
     run_dir = create_run_dir(translator_config)
@@ -455,8 +429,12 @@ def main():
 
     source_model = torch.load(checkpoint_path, map_location=device, weights_only=False)
     source_model = source_model.to(device)
-    freeze_source_model(source_model)
-    set_source_model_mode(source_model, translator_config["source_model_mode"])
+    freeze_model(source_model)
+    set_source_model_mode(
+        source_model,
+        translator_config["source_model_mode"],
+        mode_label="TRANSLATOR_SOURCE_MODEL_MODE",
+    )
 
     action_dim = train_config["dataset"]["frameskip"] * train_config["wm"]["action_dim"]
     translator = ActionTranslator(

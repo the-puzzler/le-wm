@@ -14,22 +14,8 @@ import torch
 from tqdm.auto import tqdm
 
 import config as cfg
+from script_utils import find_latest_object_checkpoint, set_source_model_mode
 from train import build_dataset, build_train_config, move_batch_to_device, resolve_device
-
-
-def find_latest_checkpoint() -> Path:
-    runs_dir = Path(cfg.RUNS_DIR)
-    candidates = sorted(
-        [
-            path
-            for path in runs_dir.glob("*/*_object.ckpt")
-            if "_decoder" not in path.name and "_translator" not in path.name
-        ],
-        key=lambda path: path.stat().st_mtime,
-    )
-    if not candidates:
-        raise FileNotFoundError(f"No object checkpoints found under: {runs_dir}")
-    return candidates[-1]
 
 
 def create_run_dir() -> Path:
@@ -55,19 +41,6 @@ def build_loader(train_config: dict):
         prefetch_factor=cfg.TRANSLATOR_PREFETCH_FACTOR if cfg.TRANSLATOR_NUM_WORKERS > 0 else None,
         pin_memory=cfg.TRANSLATOR_PIN_MEMORY,
     )
-
-
-def set_source_model_mode(model, mode: str):
-    if mode == "train":
-        model.train()
-        for module in model.modules():
-            if isinstance(module, torch.nn.Dropout):
-                module.eval()
-    elif mode == "eval":
-        model.eval()
-    else:
-        raise ValueError(f"Unsupported TRANSLATOR_SOURCE_MODEL_MODE: {mode}")
-
 
 def summarize_codebook(source_model, loader, device, train_config: dict):
     ctx_len = train_config["wm"]["history_size"]
@@ -207,13 +180,17 @@ def main():
     checkpoint_path = (
         Path(cfg.TRANSLATOR_SOURCE_CHECKPOINT)
         if cfg.TRANSLATOR_SOURCE_CHECKPOINT
-        else find_latest_checkpoint()
+        else find_latest_object_checkpoint(cfg.RUNS_DIR, exclude_name_substrings=("_decoder", "_translator"))
     )
     device = resolve_device(train_config)
     source_model = torch.load(checkpoint_path, map_location=device, weights_only=False).to(device)
     for param in source_model.parameters():
         param.requires_grad_(False)
-    set_source_model_mode(source_model, cfg.TRANSLATOR_SOURCE_MODEL_MODE)
+    set_source_model_mode(
+        source_model,
+        cfg.TRANSLATOR_SOURCE_MODEL_MODE,
+        mode_label="TRANSLATOR_SOURCE_MODEL_MODE",
+    )
 
     loader = build_loader(train_config)
     summaries = summarize_codebook(source_model, loader, device, train_config)

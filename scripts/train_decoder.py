@@ -20,11 +20,13 @@ from tqdm.auto import tqdm
 
 import config as cfg
 from module import VisualDecoder
+from script_utils import find_latest_object_checkpoint, freeze_model, set_source_model_mode
 from train import (
     build_train_config,
     build_dataset,
     build_scheduler,
     move_batch_to_device,
+    override_dataset_columns,
     resolve_amp,
     resolve_device,
 )
@@ -83,21 +85,6 @@ def save_run_config(config: dict, run_dir: Path) -> None:
         json.dump(serializable, f, indent=2)
 
 
-def find_latest_checkpoint() -> Path:
-    runs_dir = Path(cfg.RUNS_DIR)
-    candidates = sorted(
-        [
-            path
-            for path in runs_dir.glob("*/*_object.ckpt")
-            if "_decoder" not in path.name
-        ],
-        key=lambda path: path.stat().st_mtime,
-    )
-    if not candidates:
-        raise FileNotFoundError(f"No object checkpoints found under: {runs_dir}")
-    return candidates[-1]
-
-
 def build_data_loaders(train_config: dict, decoder_config: dict):
     import stable_pretraining as spt
 
@@ -132,24 +119,6 @@ def build_data_loaders(train_config: dict, decoder_config: dict):
         **loader_kwargs,
     )
     return train_loader, val_loader
-
-
-def set_source_model_mode(model, mode: str):
-    if mode == "train":
-        model.train()
-        for module in model.modules():
-            if isinstance(module, nn.Dropout):
-                module.eval()
-    elif mode == "eval":
-        model.eval()
-    else:
-        raise ValueError(f"Unsupported DECODER_SOURCE_MODEL_MODE: {mode}")
-
-
-def freeze_source_model(model):
-    for param in model.parameters():
-        param.requires_grad_(False)
-
 
 def denormalize_pixels(x: torch.Tensor) -> torch.Tensor:
     mean = torch.tensor([0.485, 0.456, 0.406], device=x.device).view(1, 3, 1, 1)
@@ -491,9 +460,18 @@ def evaluate_decoder(
 def main():
     torch.manual_seed(cfg.SEED)
 
-    train_config = build_train_config()
+    train_config = override_dataset_columns(
+        build_train_config(),
+        keys_to_load=["pixels"],
+        keys_to_cache=[],
+        keys_to_merge={},
+    )
     decoder_config = build_decoder_config()
-    checkpoint_path = Path(decoder_config["source_checkpoint"]) if decoder_config["source_checkpoint"] else find_latest_checkpoint()
+    checkpoint_path = (
+        Path(decoder_config["source_checkpoint"])
+        if decoder_config["source_checkpoint"]
+        else find_latest_object_checkpoint(cfg.RUNS_DIR, exclude_name_substrings=("_decoder",))
+    )
 
     run_dir = create_run_dir(decoder_config)
     save_run_config(
@@ -522,8 +500,12 @@ def main():
 
     source_model = torch.load(checkpoint_path, map_location=device, weights_only=False)
     source_model = source_model.to(device)
-    freeze_source_model(source_model)
-    set_source_model_mode(source_model, decoder_config["source_model_mode"])
+    freeze_model(source_model)
+    set_source_model_mode(
+        source_model,
+        decoder_config["source_model_mode"],
+        mode_label="DECODER_SOURCE_MODEL_MODE",
+    )
 
     decoder = VisualDecoder(
         embed_dim=decoder_config["embed_dim"],

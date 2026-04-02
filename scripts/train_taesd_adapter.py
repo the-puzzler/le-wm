@@ -20,6 +20,7 @@ from tqdm.auto import tqdm
 
 import config as cfg
 from module import TAEAdapter
+from script_utils import find_latest_object_checkpoint, set_source_model_mode
 from train import (
     build_train_config,
     build_dataset,
@@ -83,17 +84,6 @@ def save_run_config(config: dict, run_dir: Path) -> None:
         json.dump(serializable, f, indent=2)
 
 
-def find_latest_checkpoint() -> Path:
-    runs_dir = Path(cfg.RUNS_DIR)
-    candidates = sorted(
-        [path for path in runs_dir.glob("*/*_object.ckpt") if "_decoder" not in path.name],
-        key=lambda path: path.stat().st_mtime,
-    )
-    if not candidates:
-        raise FileNotFoundError(f"No object checkpoints found under: {runs_dir}")
-    return candidates[-1]
-
-
 def build_data_loaders(train_config: dict, adapter_config: dict):
     import stable_pretraining as spt
 
@@ -128,18 +118,6 @@ def build_data_loaders(train_config: dict, adapter_config: dict):
         **loader_kwargs,
     )
     return train_loader, val_loader
-
-
-def set_source_model_mode(model, mode: str):
-    if mode == "train":
-        model.train()
-        for module in model.modules():
-            if isinstance(module, nn.Dropout):
-                module.eval()
-    elif mode == "eval":
-        model.eval()
-    else:
-        raise ValueError(f"Unsupported TAESD_SOURCE_MODEL_MODE: {mode}")
 
 
 def freeze_module(module):
@@ -504,7 +482,7 @@ def main():
     checkpoint_path = (
         Path(adapter_config["source_checkpoint"])
         if adapter_config["source_checkpoint"]
-        else find_latest_checkpoint()
+        else find_latest_object_checkpoint(cfg.RUNS_DIR, exclude_name_substrings=("_decoder",))
     )
 
     run_dir = create_run_dir(adapter_config)
@@ -516,7 +494,11 @@ def main():
     source_model = torch.load(checkpoint_path, map_location=device, weights_only=False)
     source_model = source_model.to(device)
     freeze_module(source_model)
-    set_source_model_mode(source_model, adapter_config["source_model_mode"])
+    set_source_model_mode(
+        source_model,
+        adapter_config["source_model_mode"],
+        mode_label="TAESD_SOURCE_MODEL_MODE",
+    )
 
     try:
         taesd = AutoencoderTiny.from_pretrained(adapter_config["taesd_model_name"]).to(device)

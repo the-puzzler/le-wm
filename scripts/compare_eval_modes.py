@@ -11,6 +11,7 @@ import torch
 from tqdm.auto import tqdm
 
 import config as cfg
+from script_utils import find_latest_object_checkpoint
 from module import SIGReg
 from train import build_train_config, build_dataset, lejepa_forward, move_batch_to_device, resolve_amp, resolve_device
 
@@ -18,18 +19,6 @@ from train import build_train_config, build_dataset, lejepa_forward, move_batch_
 # Optional override. Leave as None to auto-pick the newest object checkpoint
 # from the newest run under RUNS_DIR.
 CHECKPOINT_PATH = None
-
-
-def find_latest_checkpoint() -> Path:
-    runs_dir = Path(cfg.RUNS_DIR)
-    if not runs_dir.exists():
-        raise FileNotFoundError(f"Runs directory does not exist: {runs_dir}")
-
-    candidates = sorted(runs_dir.glob("*/*_object.ckpt"), key=lambda path: path.stat().st_mtime)
-    if not candidates:
-        raise FileNotFoundError(f"No object checkpoints found under: {runs_dir}")
-    return candidates[-1]
-
 
 def build_val_loader(config: dict):
     import stable_pretraining as spt
@@ -99,7 +88,7 @@ def evaluate_once(model, sigreg, loader, device, amp_dtype, config: dict, *, tra
 
 def main():
     config = build_train_config()
-    checkpoint_path = Path(CHECKPOINT_PATH) if CHECKPOINT_PATH else find_latest_checkpoint()
+    checkpoint_path = Path(CHECKPOINT_PATH) if CHECKPOINT_PATH else find_latest_object_checkpoint(cfg.RUNS_DIR)
 
     device = resolve_device(config)
     amp_dtype, _ = resolve_amp(device, config["trainer"]["precision"])

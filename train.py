@@ -102,6 +102,22 @@ def build_train_config() -> dict:
     }
 
 
+def override_dataset_columns(
+    config: dict,
+    *,
+    keys_to_load: list[str],
+    keys_to_cache: list[str] | None = None,
+    keys_to_merge: dict[str, str] | None = None,
+) -> dict:
+    cloned = dict(config)
+    dataset_cfg = dict(cloned["dataset"])
+    dataset_cfg["keys_to_load"] = list(keys_to_load)
+    dataset_cfg["keys_to_cache"] = list(keys_to_cache or [])
+    dataset_cfg["keys_to_merge"] = dict(keys_to_merge or {})
+    cloned["dataset"] = dataset_cfg
+    return cloned
+
+
 def create_run_dir(config: dict) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     suffix = f"-{config['run_name']}" if config["run_name"] else f"-{config['dataset_preset']}"
