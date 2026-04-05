@@ -269,27 +269,94 @@ class Embedder(nn.Module):
         return x
 
 
+def _group_norm_channels(num_channels: int, max_groups: int = 8) -> int:
+    for groups in range(min(max_groups, num_channels), 0, -1):
+        if num_channels % groups == 0:
+            return groups
+    return 1
+
+
+class ResidualConvBlock(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        groups = _group_norm_channels(channels)
+        self.block = nn.Sequential(
+            nn.GroupNorm(groups, channels),
+            nn.SiLU(),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.GroupNorm(groups, channels),
+            nn.SiLU(),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+        )
+
+    def forward(self, x):
+        return x + self.block(x)
+
+
+class SpatialSelfAttention2d(nn.Module):
+    def __init__(self, channels: int, num_heads: int = 8):
+        super().__init__()
+        groups = _group_norm_channels(channels)
+        self.norm = nn.GroupNorm(groups, channels)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=channels,
+            num_heads=max(1, min(num_heads, channels)),
+            batch_first=True,
+        )
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        tokens = self.norm(x).reshape(b, c, h * w).transpose(1, 2)
+        attn_out, _ = self.attn(tokens, tokens, tokens, need_weights=False)
+        attn_out = attn_out.transpose(1, 2).reshape(b, c, h, w)
+        return x + attn_out
+
+
+class PixelShuffleBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, upscale_factor: int = 2):
+        super().__init__()
+        groups = _group_norm_channels(in_channels)
+        hidden_channels = out_channels * (upscale_factor ** 2)
+        self.block = nn.Sequential(
+            nn.GroupNorm(groups, in_channels),
+            nn.SiLU(),
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.PixelShuffle(upscale_factor),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+        )
+        self.skip = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=1),
+            nn.PixelShuffle(upscale_factor),
+        )
+
+    def forward(self, x):
+        return self.skip(x) + self.block(x)
+
+
 class VisualDecoder(nn.Module):
     def __init__(self, embed_dim: int, base_channels: int = 256):
         super().__init__()
         self.fc = nn.Sequential(
             nn.Linear(embed_dim, base_channels * 14 * 14),
-            nn.GELU(),
+            nn.SiLU(),
         )
+        mid_channels = max(base_channels // 2, 64)
+        low_channels = max(base_channels // 4, 32)
+        tiny_channels = max(base_channels // 8, 16)
         self.net = nn.Sequential(
-            nn.ConvTranspose2d(base_channels, 128, kernel_size=4, stride=2, padding=1),
-            nn.GroupNorm(8, 128),
-            nn.GELU(),
-            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
-            nn.GroupNorm(8, 64),
-            nn.GELU(),
-            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
-            nn.GroupNorm(8, 32),
-            nn.GELU(),
-            nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1),
-            nn.GroupNorm(8, 16),
-            nn.GELU(),
-            nn.Conv2d(16, 3, kernel_size=3, padding=1),
+            ResidualConvBlock(base_channels),
+            SpatialSelfAttention2d(base_channels),
+            PixelShuffleBlock(base_channels, mid_channels),
+            ResidualConvBlock(mid_channels),
+            PixelShuffleBlock(mid_channels, low_channels),
+            ResidualConvBlock(low_channels),
+            PixelShuffleBlock(low_channels, tiny_channels),
+            ResidualConvBlock(tiny_channels),
+            PixelShuffleBlock(tiny_channels, tiny_channels),
+            ResidualConvBlock(tiny_channels),
+            nn.GroupNorm(_group_norm_channels(tiny_channels), tiny_channels),
+            nn.SiLU(),
+            nn.Conv2d(tiny_channels, 3, kernel_size=3, padding=1),
         )
 
     def forward(self, z):
