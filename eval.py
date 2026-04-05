@@ -3,6 +3,7 @@ import os
 os.environ["MUJOCO_GL"] = "egl"
 
 import json
+import shutil
 import time
 from collections import deque
 from importlib import import_module
@@ -258,6 +259,59 @@ def load_action_translator(device, train_config: dict, config: dict):
     return translator, checkpoint_path
 
 
+def create_eval_run_dir(results_path: Path) -> Path:
+    timestamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    run_dir = results_path / "eval_tasks" / timestamp
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def build_task_dirs(run_dir: Path, episodes, start_steps):
+    task_dirs = []
+    for idx, (episode_idx, start_step) in enumerate(zip(episodes, start_steps, strict=True)):
+        task_dir = run_dir / f"task_{idx:03d}_episode_{int(episode_idx)}_start_{int(start_step)}"
+        task_dir.mkdir(parents=True, exist_ok=True)
+        task_dirs.append(task_dir)
+    return task_dirs
+
+
+def save_task_metadata(
+    task_dirs,
+    episodes,
+    start_steps,
+    config: dict,
+    metrics: dict,
+):
+    episode_successes = metrics.get("episode_successes")
+    for idx, task_dir in enumerate(task_dirs):
+        success = None
+        if episode_successes is not None:
+            success = bool(episode_successes[idx])
+        payload = {
+            "task_index": idx,
+            "episode_idx": int(episodes[idx]),
+            "start_step": int(start_steps[idx]),
+            "goal_offset_steps": int(config["eval_goal_offset_steps"]),
+            "eval_budget": int(config["eval_budget"]),
+            "success": success,
+        }
+        with (task_dir / "task_info.json").open("w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+
+
+def relocate_rollout_videos(video_dir: Path, task_dirs) -> None:
+    for idx, task_dir in enumerate(task_dirs):
+        src = video_dir / f"rollout_{idx}.mp4"
+        if src.exists():
+            shutil.move(str(src), str(task_dir / "rollout.mp4"))
+
+
+def save_policy_artifacts(policy, task_dirs) -> None:
+    if not hasattr(policy, "export_task_artifacts"):
+        return
+    policy.export_task_artifacts(task_dirs)
+
+
 class LatentActionCostModel:
     def __init__(
         self,
@@ -331,7 +385,7 @@ class LatentActionCostModel:
         code_indices = action_candidates.round().clamp(0, self.num_codes - 1)
         return code_indices.to(dtype=torch.long).squeeze(-1)
 
-    def _rollout(self, info_dict: dict, code_indices, decode_actions: bool):
+    def _rollout(self, info_dict: dict, code_indices, decode_actions: bool, return_latents: bool = False):
         import torch
 
         batch_size, num_samples, horizon = code_indices.shape
@@ -341,6 +395,7 @@ class LatentActionCostModel:
         flat_codes = code_indices.reshape(batch_size * num_samples, horizon)
 
         decoded_chunks = []
+        predicted_latents = []
         for t in range(horizon):
             current_code = flat_codes[:, t]
             if decode_actions:
@@ -353,6 +408,8 @@ class LatentActionCostModel:
             act_emb = self.model.quantizer.codebook(code_hist)
             seq_len = min(self.history_size, emb.size(1), act_emb.size(1))
             pred_emb = self.model.predict(emb[:, -seq_len:], act_emb[:, -seq_len:])[:, -1:]
+            if return_latents:
+                predicted_latents.append(pred_emb[:, 0])
             emb = torch.cat([emb, pred_emb], dim=1)
 
         final_emb = emb[:, -1].view(batch_size, num_samples, -1)
@@ -366,7 +423,11 @@ class LatentActionCostModel:
                 self.real_action_block,
                 self.real_action_dim,
             )
-        return final_emb, decoded_plan
+        state_latents = None
+        if return_latents:
+            state_latents = torch.stack(predicted_latents, dim=1)
+            state_latents = state_latents.view(batch_size, num_samples, horizon, -1)
+        return final_emb, decoded_plan, state_latents
 
     def get_cost(self, info_dict: dict, action_candidates):
         import torch
@@ -375,7 +436,12 @@ class LatentActionCostModel:
         info_dict = self._move_info(info_dict)
         code_indices = self._quantize_candidates(action_candidates)
         goal_emb = self._encode_goal(info_dict).unsqueeze(1)
-        final_emb, _ = self._rollout(info_dict, code_indices, decode_actions=False)
+        final_emb, _, _ = self._rollout(
+            info_dict,
+            code_indices,
+            decode_actions=False,
+            return_latents=False,
+        )
         goal_emb = goal_emb.expand_as(final_emb)
         return F.mse_loss(final_emb, goal_emb.detach(), reduction="none").sum(dim=-1)
 
@@ -388,8 +454,38 @@ class LatentActionCostModel:
         if not torch.is_tensor(latent_plan):
             latent_plan = torch.as_tensor(latent_plan, device=self.device)
         code_indices = self._quantize_candidates(latent_plan.to(self.device))
-        _, decoded_plan = self._rollout(info_dict, code_indices, decode_actions=True)
+        _, decoded_plan, _ = self._rollout(
+            info_dict,
+            code_indices,
+            decode_actions=True,
+            return_latents=False,
+        )
         return decoded_plan[:, 0]
+
+    def analyze_plan(self, info_dict: dict, latent_plan):
+        import torch
+
+        info_dict = self._move_info(info_dict)
+        if latent_plan.ndim == 2:
+            latent_plan = latent_plan.unsqueeze(-1)
+        if latent_plan.ndim == 3:
+            latent_plan = latent_plan.unsqueeze(1)
+        if not torch.is_tensor(latent_plan):
+            latent_plan = torch.as_tensor(latent_plan, device=self.device)
+        latent_plan = latent_plan.to(self.device)
+        code_indices = self._quantize_candidates(latent_plan)
+        _, decoded_plan, state_latents = self._rollout(
+            info_dict,
+            code_indices,
+            decode_actions=True,
+            return_latents=True,
+        )
+        return {
+            "latent_action_plan": latent_plan[:, 0].detach().cpu(),
+            "quantized_action_codes": code_indices[:, 0].detach().cpu(),
+            "decoded_action_plan": decoded_plan[:, 0].detach().cpu(),
+            "state_plan_latents": state_latents[:, 0].detach().cpu(),
+        }
 
 
 class LatentActionWorldModelPolicy:
@@ -405,6 +501,8 @@ class LatentActionWorldModelPolicy:
         self.real_action_dim = model.real_action_dim
         self._action_buffer = None
         self._next_init = None
+        self._task_artifacts = None
+        self._env_steps = None
 
     @property
     def flatten_receding_horizon(self) -> int:
@@ -424,6 +522,8 @@ class LatentActionWorldModelPolicy:
             n_envs=getattr(env, "num_envs", 1),
             config=self.cfg,
         )
+        self._task_artifacts = [[] for _ in range(env.num_envs)]
+        self._env_steps = np.zeros(env.num_envs, dtype=np.int64)
 
     def _prepare_info(self, info_dict: dict):
         import torch
@@ -472,21 +572,86 @@ class LatentActionWorldModelPolicy:
         if len(self._action_buffer) == 0:
             outputs = self.solver(info_dict, init_action=self._next_init)
             latent_actions = outputs["actions"]
+            plan_analysis = self.model.analyze_plan(info_dict, latent_actions)
             keep_horizon = self.cfg.receding_horizon
             plan = latent_actions[:, :keep_horizon]
             rest = latent_actions[:, keep_horizon:]
             self._next_init = rest if self.cfg.warm_start else None
 
-            decoded = self.model.decode_action_plan(info_dict, plan)
+            decoded = plan_analysis["decoded_action_plan"][:, :keep_horizon]
             decoded = decoded.reshape(
                 self.env.num_envs,
                 self.flatten_receding_horizon,
                 self.real_action_dim,
             )
             self._action_buffer.extend(decoded.transpose(0, 1).cpu())
+            for env_idx in range(self.env.num_envs):
+                self._task_artifacts[env_idx].append(
+                    {
+                        "replan_index": len(self._task_artifacts[env_idx]),
+                        "env_step": int(self._env_steps[env_idx]),
+                        "latent_action_plan": plan_analysis["latent_action_plan"][env_idx].clone(),
+                        "quantized_action_codes": plan_analysis["quantized_action_codes"][env_idx].clone(),
+                        "decoded_action_plan": plan_analysis["decoded_action_plan"][env_idx].clone(),
+                        "state_plan_latents": plan_analysis["state_plan_latents"][env_idx].clone(),
+                        "executed_latent_action_plan": plan_analysis["latent_action_plan"][env_idx, :keep_horizon].clone(),
+                        "executed_quantized_action_codes": plan_analysis["quantized_action_codes"][env_idx, :keep_horizon].clone(),
+                        "executed_decoded_action_plan": plan_analysis["decoded_action_plan"][env_idx, :keep_horizon].clone(),
+                        "warm_start_latent_action_plan": plan_analysis["latent_action_plan"][env_idx, keep_horizon:].clone(),
+                    }
+                )
 
         action = self._action_buffer.popleft().numpy()
+        self._env_steps += 1
         return action.reshape(*self.env.action_space.shape)
+
+    def export_task_artifacts(self, task_dirs) -> None:
+        import torch
+
+        if self._task_artifacts is None:
+            return
+        for task_dir, replans in zip(task_dirs, self._task_artifacts, strict=True):
+            state_latent_payload = {
+                "policy_type": self.type,
+                "replans": [
+                    {
+                        "replan_index": record["replan_index"],
+                        "env_step": record["env_step"],
+                        "state_plan_latents": record["state_plan_latents"],
+                    }
+                    for record in replans
+                ],
+            }
+            action_latent_payload = {
+                "policy_type": self.type,
+                "real_action_block": self.real_action_block,
+                "real_action_dim": self.real_action_dim,
+                "replans": [
+                    {
+                        "replan_index": record["replan_index"],
+                        "env_step": record["env_step"],
+                        "latent_action_plan": record["latent_action_plan"],
+                        "quantized_action_codes": record["quantized_action_codes"],
+                        "decoded_action_plan": record["decoded_action_plan"],
+                        "executed_latent_action_plan": record["executed_latent_action_plan"],
+                        "executed_quantized_action_codes": record["executed_quantized_action_codes"],
+                        "executed_decoded_action_plan": record["executed_decoded_action_plan"],
+                        "warm_start_latent_action_plan": record["warm_start_latent_action_plan"],
+                    }
+                    for record in replans
+                ],
+            }
+            torch.save(state_latent_payload, task_dir / "planning_latents.pt")
+            torch.save(action_latent_payload, task_dir / "action_planning_latents.pt")
+            torch.save(
+                {
+                    "policy_type": self.type,
+                    "real_action_block": self.real_action_block,
+                    "real_action_dim": self.real_action_dim,
+                    "replans": replans,
+                },
+                task_dir / "planning_artifacts.pt",
+            )
 
 
 def main():
@@ -610,6 +775,10 @@ def main():
 
     world.set_policy(policy)
 
+    eval_run_dir = create_eval_run_dir(results_path)
+    task_dirs = build_task_dirs(eval_run_dir, eval_episodes, eval_start_idx)
+    video_dir = eval_run_dir / "_videos"
+
     start_time = time.time()
     metrics = world.evaluate_from_dataset(
         dataset,
@@ -618,9 +787,15 @@ def main():
         eval_budget=config["eval_budget"],
         episodes_idx=eval_episodes.tolist(),
         callables=config["callables"],
-        video_path=results_path,
+        video_path=video_dir,
     )
     end_time = time.time()
+
+    relocate_rollout_videos(video_dir, task_dirs)
+    save_task_metadata(task_dirs, eval_episodes, eval_start_idx, config, metrics)
+    save_policy_artifacts(policy, task_dirs)
+    if video_dir.exists():
+        video_dir.rmdir()
 
     print(metrics)
 
@@ -632,6 +807,7 @@ def main():
         f.write(json.dumps(config, indent=2))
         f.write("\n\n")
         f.write("==== RESULTS ====\n")
+        f.write(f"artifacts_dir: {eval_run_dir}\n")
         f.write(f"metrics: {metrics}\n")
         f.write(f"evaluation_time: {end_time - start_time} seconds\n")
 
