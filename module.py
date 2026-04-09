@@ -110,10 +110,10 @@ class IDAttention(nn.Module):
         """
         _, T, _ = x.shape
         x = self.norm(x)
-        #Can see everything before t and t+1
-        peekattnmask = torch.triu(
+        # Allow attention to all previous positions, the current token, and one step ahead.
+        peekattnmask = torch.tril(
             torch.ones((T, T), device=x.device, dtype=torch.bool),
-            diagonal=-1,
+            diagonal=1,
         )
         drop = self.dropout if self.training else 0.0
         qkv = self.to_qkv(x).chunk(3, dim=-1)  # q, k, v: (B, heads, T, dim_head)
